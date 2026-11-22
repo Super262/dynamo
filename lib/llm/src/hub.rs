@@ -177,14 +177,15 @@ pub async fn from_hf(name: impl AsRef<Path>, ignore_weights: bool) -> anyhow::Re
     }
 
     let mut config: MxClientConfig = MxClientConfig::default();
-    if provider == MxModelProvider::Ngc {
+    if is_no_shared_storage() {
+        config.cache.shared_storage = false;
+    }
+    // Streamed snapshots must land in the same cache used by the local lookup.
+    if provider == MxModelProvider::Ngc || !config.cache.shared_storage {
         config.cache.local_path = get_model_express_cache_dir(provider);
     }
     if let Ok(endpoint) = env::var(env_model::model_express::MODEL_EXPRESS_URL) {
         config = config.with_endpoint(endpoint);
-    }
-    if is_no_shared_storage() {
-        config.cache.shared_storage = false;
     }
 
     let result = match MxClient::new(config).await {
