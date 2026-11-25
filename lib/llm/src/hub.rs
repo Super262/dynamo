@@ -255,17 +255,15 @@ async fn mx_download_from_server(
     hf_stream_cache: Option<&Path>,
 ) -> anyhow::Result<PathBuf> {
     let staging = if let Some(cache) = hf_stream_cache {
-        tokio::fs::create_dir_all(cache)
-            .await
-            .with_context(|| format!("Failed to create Hugging Face cache {}", cache.display()))?;
-        // ModelExpress writes directly to final filenames. Keep the stream outside
-        // the snapshot tree until the client has accepted every file.
-        let staging = tempfile::Builder::new()
-            .prefix(".mx-")
-            .tempdir_in(cache)
-            .with_context(|| format!("Failed to stage a download in {}", cache.display()))?;
+        let cache = cache.to_path_buf();
+        let (staging, cache) = tokio::task::spawn_blocking(move || {
+            let staging = StreamStaging::new(&cache)
+                .with_context(|| format!("Failed to stage a download in {}", cache.display()))?;
+            anyhow::Ok((staging, cache))
+        })
+        .await??;
         config.cache.local_path = staging.path().to_path_buf();
-        Some((staging, cache.to_path_buf()))
+        Some((staging, cache))
     } else {
         None
     };
@@ -293,6 +291,111 @@ async fn mx_download_from_server(
     }
 
     client.get_model_path(model_name, provider).await
+}
+
+struct StreamStaging {
+    // Drop the directory while we still own its slot.
+    dir: tempfile::TempDir,
+    _owner: fs::File,
+}
+
+impl StreamStaging {
+    fn new(cache: &Path) -> std::io::Result<Self> {
+        // HF cache tools skip .locks when enumerating model repositories.
+        let locks = cache.join(".locks");
+        fs::create_dir_all(&locks)?;
+        if !fs::symlink_metadata(&locks)?.is_dir() {
+            return Err(std::io::Error::other(
+                "Invalid Hugging Face .locks directory",
+            ));
+        }
+        let mut reserved = None;
+        let mut index = 0_u64;
+        let (slot, owner) = loop {
+            // Keep each lock inode across transfers, including while its data is removed.
+            let name = format!("dynamo-mx-stream-{index}");
+            index += 1;
+            let lock_path = locks.join(format!("{name}.lock"));
+            let owner = match lock_stream_slot(&lock_path, reserved.is_none()) {
+                Ok(Some(owner)) => owner,
+                Ok(None) => continue,
+                // Once we have a slot, only visit slots that already exist.
+                Err(error) if error.kind() == ErrorKind::NotFound => {
+                    break reserved.ok_or(error)?;
+                }
+                Err(error) => {
+                    if let Some(slot) = reserved {
+                        tracing::warn!(path = %lock_path.display(), %error, "Could not check remaining ModelExpress staging slots");
+                        break slot;
+                    }
+                    return Err(error);
+                }
+            };
+
+            let path = locks.join(&name);
+            match fs::remove_dir_all(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error)
+                    if reserved.is_some()
+                        || matches!(
+                            error.kind(),
+                            ErrorKind::PermissionDenied
+                                | ErrorKind::DirectoryNotEmpty
+                                | ErrorKind::NotADirectory
+                        ) =>
+                {
+                    tracing::warn!(path = %path.display(), %error, "Failed to reclaim ModelExpress staging directory");
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
+            if reserved.is_none() {
+                reserved = Some((path, owner));
+            }
+        };
+        fs::create_dir(&slot)?;
+        // A cancelled async filesystem operation may still finish on a blocking
+        // thread. Give each transfer its own path, even when reusing a slot.
+        let dir = tempfile::tempdir_in(slot)?;
+        Ok(Self { dir, _owner: owner })
+    }
+
+    fn path(&self) -> &Path {
+        self.dir.path()
+    }
+}
+
+fn lock_stream_slot(path: &Path, create: bool) -> std::io::Result<Option<fs::File>> {
+    let mut options = fs::File::options();
+    options
+        .read(true)
+        .write(true)
+        .create(create)
+        .truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let owner = match options.open(path) {
+        Ok(file) => file,
+        // A different user of a shared cache can own this slot.
+        Err(error) if error.kind() == ErrorKind::PermissionDenied && path.try_exists()? => {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    if !owner.metadata()?.is_file() {
+        return Err(std::io::Error::other(
+            "Invalid ModelExpress staging lock file",
+        ));
+    }
+    match owner.try_lock() {
+        Ok(()) => Ok(Some(owner)),
+        Err(fs::TryLockError::WouldBlock) => Ok(None),
+        Err(fs::TryLockError::Error(error)) => Err(error),
+    }
 }
 
 fn publish_streamed_hf_snapshot(
@@ -510,6 +613,43 @@ mod tests {
             fs::write(snapshot_dir.join(f), "{}").unwrap();
         }
         snapshot_dir
+    }
+
+    #[test]
+    fn stream_staging_reclaims_abandoned_slots_and_preserves_live_downloads() {
+        let cache = TempDir::new().unwrap();
+        let active = StreamStaging::new(cache.path()).unwrap();
+        let abandoned = StreamStaging::new(cache.path()).unwrap();
+        let higher_slot = StreamStaging::new(cache.path()).unwrap();
+        fs::write(active.path().join("partial"), b"live").unwrap();
+
+        // Simulate the filesystem state after the kernel releases a dead owner's lock.
+        let abandon = |stage: StreamStaging| {
+            let path = stage.dir.keep();
+            fs::write(path.join("partial"), b"abandoned").unwrap();
+            path
+        };
+        let stale = abandon(abandoned);
+        let higher = abandon(higher_slot);
+        let retry = StreamStaging::new(cache.path()).unwrap();
+        assert_eq!(retry.path().parent(), stale.parent());
+        assert_ne!(retry.path(), stale);
+        assert!(!stale.exists());
+        assert!(!higher.exists());
+        assert_eq!(fs::read(active.path().join("partial")).unwrap(), b"live");
+    }
+
+    #[test]
+    fn stream_staging_skips_an_unusable_slot() {
+        let cache = TempDir::new().unwrap();
+        let first = StreamStaging::new(cache.path()).unwrap();
+        let slot = first.path().parent().unwrap().to_owned();
+        drop(first);
+        fs::remove_dir(&slot).unwrap();
+        fs::write(&slot, b"keep").unwrap();
+        let retry = StreamStaging::new(cache.path()).unwrap();
+        assert_ne!(retry.path().parent(), Some(slot.as_path()));
+        assert_eq!(fs::read(slot).unwrap(), b"keep");
     }
 
     #[test]
