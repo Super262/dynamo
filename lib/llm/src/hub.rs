@@ -185,13 +185,7 @@ fn has_model_weights(
 // A finished stream validates delivered bytes, but has no upstream artifact
 // inventory. Require evidence of a complete tokenizer layout for the backend.
 fn has_backend_tokenizer_files(snapshot: &Path) -> io::Result<bool> {
-    let has = |name| match fs::metadata(snapshot.join(name)) {
-        Ok(meta) => Ok(meta.is_file() && meta.len() > 0),
-        Err(error) if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
-            Ok(false)
-        }
-        Err(error) => Err(error),
-    };
+    let has = |name| cached_nonempty_file(&snapshot.join(name));
     let single_files = [
         "tokenizer.model",
         "spiece.model",
@@ -208,6 +202,16 @@ fn has_backend_tokenizer_files(snapshot: &Path) -> io::Result<bool> {
     )
 }
 
+fn cached_nonempty_file(path: &Path) -> io::Result<bool> {
+    match fs::metadata(path) {
+        Ok(meta) => Ok(meta.is_file() && meta.len() > 0),
+        Err(error) if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 // Some model backends consume tokenizer files that Dynamo does not recognize.
 fn has_backend_model_files(snapshot: &Path, files: &[String]) -> io::Result<bool> {
     match cached_file_type(&snapshot.join("config.json"))? {
@@ -219,6 +223,10 @@ fn has_backend_model_files(snapshot: &Path, files: &[String]) -> io::Result<bool
     if !has_model_weights(snapshot, || cached_file(&snapshot.join("params.json")))? {
         return Ok(false);
     }
+    model_artifacts_present(snapshot, files)
+}
+
+fn model_artifacts_present(snapshot: &Path, files: &[String]) -> io::Result<bool> {
     for name in files {
         if Path::new(name).file_name() != Some(OsStr::new(name))
             || !cached_file(&snapshot.join(name))?
@@ -418,6 +426,27 @@ pub(super) fn hf_cache_roots() -> impl Iterator<Item = PathBuf> {
     std::iter::once(preferred).chain(shared)
 }
 
+// A checked metadata fetch can publish into the preferred cache even if the
+// other shared cache cannot be read. Keep that error for a failed online retry.
+pub(super) fn checked_hf_cache_hit<T>(
+    mut inspect: impl FnMut(&Path) -> anyhow::Result<Option<T>>,
+) -> anyhow::Result<(Option<T>, Option<anyhow::Error>)> {
+    let offline = is_offline_mode();
+    let mut supplemental_error = None;
+    let hit = first_cache_hit(hf_cache_roots().enumerate().map(|(index, root)| {
+        let candidate = inspect(&root)
+            .with_context(|| format!("Inspecting Hugging Face cache {}", root.display()));
+        match candidate {
+            Err(error) if index > 0 && !offline => {
+                supplemental_error.get_or_insert(error);
+                Ok(None)
+            }
+            result => result,
+        }
+    }))?;
+    Ok((hit, supplemental_error))
+}
+
 fn hf_repo_cache_dir(repo: &str) -> PathBuf {
     get_model_express_cache_dir(MxModelProvider::HuggingFace)
         .join(hf_hub::Repo::model(repo.to_owned()).folder_name())
@@ -479,9 +508,11 @@ async fn fetch_snapshot(name: &Path, request: SnapshotRequest) -> anyhow::Result
     .await
     {
         Ok(path) => Ok(path),
-        // Both downloaders publish into the same HF cache.
+        // The direct downloader publishes in the preferred cache. A separate
+        // shared cache's inspection error does not block those writes.
         Err(error)
-            if error.is::<InvalidCacheDirectory>() || error.is::<CacheInspectionFailed>() =>
+            if !error.is::<SupplementalCacheInspectionFailed>()
+                && (error.is::<InvalidCacheDirectory>() || error.is::<CacheInspectionFailed>()) =>
         {
             Err(error)
         }
@@ -609,7 +640,7 @@ fn shared_hf_revision(
         "Invalid Hugging Face revision returned by ModelExpress"
     );
     let mut provider_path = None;
-    let complete = first_cache_hit(hf_cache_roots().map(|root| {
+    let mut inspect = |root: &Path| {
         let repo = root.join(folder);
         let path = repo.join("snapshots").join(rev);
         let candidate = read_hf_checkout(&repo, || {
@@ -621,8 +652,8 @@ fn shared_hf_revision(
                     if has_required_model_files(&path, *ignore_weights)? {
                         return Ok(Some(true));
                     }
-                    let eligible =
-                        *ignore_weights || !metadata_only_revisions(&root, &repo)?.contains(rev);
+                    let eligible = *ignore_weights
+                        || !hf_publication_order(root, &repo)?.is_metadata_only(&path)?;
                     Ok(eligible.then_some(false))
                 }
                 SnapshotRequest::CheckedMetadata { .. } => match request.verify_metadata(&path) {
@@ -640,16 +671,36 @@ fn shared_hf_revision(
             _ => {}
         }
         Ok(None)
-    }))
-    .context(CacheInspectionFailed)?;
-    complete
-        .or(provider_path)
-        .with_context(|| format!("ModelExpress revision {rev} is unavailable in the shared cache"))
+    };
+    let (complete, supplemental_error) =
+        if matches!(request, SnapshotRequest::CheckedMetadata { .. }) {
+            checked_hf_cache_hit(inspect).context(CacheInspectionFailed)?
+        } else {
+            (
+                first_cache_hit(hf_cache_roots().map(|root| inspect(&root)))
+                    .context(CacheInspectionFailed)?,
+                None,
+            )
+        };
+    if let Some(path) = complete.or(provider_path) {
+        return Ok(path);
+    }
+    let unavailable = || format!("ModelExpress revision {rev} is unavailable in the shared cache");
+    if let Some(error) = supplemental_error {
+        return Err(error
+            .context(unavailable())
+            .context(SupplementalCacheInspectionFailed));
+    }
+    anyhow::bail!("{}", unavailable())
 }
 
 #[derive(Debug, thiserror::Error)]
 #[error("Failed to inspect shared Hugging Face cache")]
 struct CacheInspectionFailed;
+
+#[derive(Debug, thiserror::Error)]
+#[error("Failed to inspect supplemental shared Hugging Face cache")]
+struct SupplementalCacheInspectionFailed;
 
 pub(super) fn hf_snapshot_repo(path: &Path) -> anyhow::Result<&Path> {
     path.parent()
@@ -819,9 +870,78 @@ struct HfRequestOrder {
     main: Option<PublishedMain>,
     #[serde(default)]
     metadata_only: Option<std::collections::BTreeSet<String>>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    metadata_checkouts: std::collections::BTreeMap<String, MetadataCheckout>,
     // The existing serialized field also records full backend-tokenized streams.
     #[serde(default)]
     direct_models: std::collections::BTreeMap<String, Vec<String>>,
+}
+
+// A revision can be evicted and reinstalled by ModelExpress without touching .order.
+#[derive(serde::Deserialize, serde::Serialize)]
+struct MetadataCheckout {
+    created: Option<std::time::SystemTime>,
+    inode: Option<u64>,
+    files: Vec<String>,
+}
+
+impl MetadataCheckout {
+    fn identity(path: &Path) -> io::Result<(Option<std::time::SystemTime>, Option<u64>)> {
+        let metadata = fs::metadata(path)?;
+        #[cfg(unix)]
+        let inode = Some(std::os::unix::fs::MetadataExt::ino(&metadata));
+        #[cfg(not(unix))]
+        let inode = None;
+        Ok((metadata.created().ok(), inode))
+    }
+
+    fn capture(path: &Path) -> io::Result<Self> {
+        let (created, inode) = Self::identity(path)?;
+        Ok(Self {
+            created,
+            inode,
+            files: provider_weight_files(path)?,
+        })
+    }
+}
+
+// A new README or tokenizer file cannot prove a previously weightless checkout
+// was filled. Use positively identifiable standalone model payloads. Sharded
+// HF models must satisfy their index instead of being inferred from one shard.
+fn provider_weight_files(path: &Path) -> io::Result<Vec<String>> {
+    let mut indexes = Vec::new();
+    let mut has_index = false;
+    for name in HF_WEIGHT_INDEXES {
+        let index = path.join(name);
+        if cached_file(&index)? {
+            has_index = true;
+            if shard_files_present(&index)? {
+                indexes.push(name.to_owned());
+            }
+        }
+    }
+    if has_index {
+        return Ok(indexes);
+    }
+    let mut files = Vec::new();
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if !name.contains("-of-")
+            && (modelexpress_common::providers::is_weight_file(&name)
+                || matches!(
+                    Path::new(&name).extension().and_then(OsStr::to_str),
+                    Some("weights" | "gguf" | "onnx" | "engine")
+                ))
+            && cached_nonempty_file(&entry.path())?
+        {
+            files.push(name);
+        }
+    }
+    files.sort_unstable();
+    Ok(files)
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -829,6 +949,8 @@ struct PublishedMain {
     ticket: u64,
     revision: String,
     kind: PublishedSnapshotKind,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    provider_files: Vec<String>,
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -877,6 +999,9 @@ impl PublishedMain {
                         .map(|sidecars| has_backend_model_files(&path, sidecars)),
                 ),
             ),
+            PublishedSnapshotKind::ProviderDefinedFull if !self.provider_files.is_empty() => {
+                model_artifacts_present(&path, &self.provider_files)
+            }
             _ => match fs::metadata(&path) {
                 Ok(meta) => Ok(meta.is_dir()),
                 Err(e) if e.kind() == ErrorKind::NotFound => Ok(false),
@@ -887,6 +1012,27 @@ impl PublishedMain {
 }
 
 impl HfRequestOrder {
+    fn is_metadata_only(&self, path: &Path) -> io::Result<bool> {
+        let Some(revision) = path.file_name().and_then(OsStr::to_str) else {
+            return Ok(false);
+        };
+        if !self
+            .metadata_only
+            .as_ref()
+            .is_some_and(|revs| revs.contains(revision))
+        {
+            return Ok(false);
+        }
+        let Some(saved) = self.metadata_checkouts.get(revision) else {
+            // Legacy orders have no checkout identity or inventory.
+            return Ok(true);
+        };
+        let replaced = (saved.created, saved.inode) != MetadataCheckout::identity(path)?;
+        Ok(!provider_weight_files(path)?
+            .iter()
+            .any(|name| replaced || !saved.files.contains(name)))
+    }
+
     fn read(path: &Path) -> anyhow::Result<Self> {
         match fs::read(path) {
             Ok(bytes) => {
@@ -1051,7 +1197,7 @@ fn publish_hf_snapshot(
         Ok(_) => return Err(InvalidCacheDirectory(destination).into()),
         Err(e) if e.kind() == ErrorKind::NotFound => {
             // A cold revision still becomes visible with one directory rename.
-            moves.push((snapshot.to_owned(), destination));
+            moves.push((snapshot.to_owned(), destination.clone()));
             true
         }
         Err(e) => return Err(e.into()),
@@ -1080,14 +1226,30 @@ fn publish_hf_snapshot(
             true
         });
     let revision = revision.to_str().context("Invalid HF revision encoding")?;
-    let metadata_only = order.metadata_only.get_or_insert_default();
-    // A metadata merge into an existing provider checkout does not establish
-    // that its preexisting contents are metadata-only.
-    let provenance_changed = if request.ignore_weights() {
-        new_revision && metadata_only.insert(revision.to_owned())
-    } else {
-        metadata_only.remove(revision)
-    };
+    // Metadata merged into an existing provider checkout cannot establish that
+    // its preexisting payload is weightless. Extend the inventory only when
+    // Dynamo still recognizes the original metadata checkout.
+    let provenance_changed =
+        if request.ignore_weights() && (new_revision || order.is_metadata_only(&destination)?) {
+            let mut checkout =
+                MetadataCheckout::capture(if new_revision { snapshot } else { &destination })?;
+            if !new_revision {
+                checkout.files.extend(provider_weight_files(snapshot)?);
+                checkout.files.sort_unstable();
+                checkout.files.dedup();
+            }
+            order
+                .metadata_only
+                .get_or_insert_default()
+                .insert(revision.to_owned());
+            order
+                .metadata_checkouts
+                .insert(revision.to_owned(), checkout);
+            true
+        } else {
+            order.metadata_checkouts.remove(revision);
+            order.metadata_only.get_or_insert_default().remove(revision)
+        };
     let mut direct_changed = false;
     let kind = if request.ignore_weights() {
         PublishedSnapshotKind::Metadata
@@ -1119,6 +1281,11 @@ fn publish_hf_snapshot(
         order.main = Some(PublishedMain {
             ticket,
             revision: revision.to_owned(),
+            provider_files: if matches!(kind, PublishedSnapshotKind::ProviderDefinedFull) {
+                backend_model_artifacts(snapshot)?
+            } else {
+                Vec::new()
+            },
             kind,
         });
     }
@@ -1380,6 +1547,25 @@ fn merge_ref_revision(path: &Path) -> anyhow::Result<Option<String>> {
     )
 }
 
+fn remove_recovered_ref(path: &Path, revision: &str) -> anyhow::Result<()> {
+    let remove = || -> anyhow::Result<()> {
+        if merge_ref_revision(path)?.as_deref() == Some(revision) {
+            fs::remove_file(path)?;
+        }
+        Ok(())
+    };
+    match remove() {
+        Err(error)
+            if error
+                .downcast_ref::<io::Error>()
+                .is_some_and(|e| e.kind() == ErrorKind::NotFound) =>
+        {
+            Ok(())
+        }
+        result => result,
+    }
+}
+
 fn rollback_snapshot_merge(repo: &Path, journal: &Path, retired: &Path) -> anyhow::Result<()> {
     anyhow::ensure!(
         fs::symlink_metadata(journal)?.is_dir(),
@@ -1547,17 +1733,84 @@ fn rollback_snapshot_merge(repo: &Path, journal: &Path, retired: &Path) -> anyho
             metadata.retain(|revision| !evicted && !ref_unavailable(revision));
         }
         order
+            .metadata_checkouts
+            .retain(|revision, _| !evicted && !ref_unavailable(revision));
+        order
             .direct_models
             .retain(|revision, _| !evicted && !ref_unavailable(revision));
-        if let (Some(current), Some(staged)) = (keep_main, staged_order)
-            && let Some(published) = HfRequestOrder::read(&staged)?.main
-            && published.revision == current
-        {
-            order.main = Some(published);
+        let mut clear_main = None;
+        if let (Some(current), Some(staged)) = (keep_main, staged_order) {
+            let next = HfRequestOrder::read(&staged)?;
+            if let Some(published) = next.main
+                && published.revision == current
+            {
+                let path = snapshots.join(&current);
+                // Replay may just have removed the only weights in this revision.
+                // Retain the ticket only for a checkout complete in its own layout.
+                let mut recovered_artifacts = None;
+                let complete = match published.kind {
+                    PublishedSnapshotKind::Metadata => true,
+                    PublishedSnapshotKind::Full => has_required_model_files(&path, false)?,
+                    PublishedSnapshotKind::DirectFull => {
+                        let previous = order
+                            .direct_models
+                            .get(&current)
+                            .into_iter()
+                            .map(|files| has_backend_model_files(&path, files));
+                        let attempted = next.direct_models.get(&current).into_iter().map(|files| {
+                            let complete = has_backend_model_files(&path, files)?;
+                            if complete {
+                                recovered_artifacts = Some(files.clone());
+                            }
+                            Ok(complete)
+                        });
+                        any_available(
+                            std::iter::once_with(|| has_required_model_files(&path, false))
+                                .chain(previous)
+                                .chain(attempted),
+                        )?
+                    }
+                    PublishedSnapshotKind::ProviderDefinedFull => any_available(
+                        std::iter::once_with(|| has_required_model_files(&path, false)).chain(
+                            std::iter::once_with(|| {
+                                if order.is_metadata_only(&path)? {
+                                    return Ok(false);
+                                }
+                                if published.provider_files.is_empty() {
+                                    Ok(!provider_weight_files(&path)?.is_empty())
+                                } else {
+                                    model_artifacts_present(&path, &published.provider_files)
+                                }
+                            }),
+                        ),
+                    )?,
+                };
+                if complete {
+                    if let Some(files) = recovered_artifacts {
+                        order.direct_models.insert(current, files);
+                    }
+                    order.main = Some(published);
+                } else {
+                    order.main = None;
+                    order
+                        .metadata_only
+                        .get_or_insert_default()
+                        .insert(current.clone());
+                    order
+                        .metadata_checkouts
+                        .insert(current.clone(), MetadataCheckout::capture(&path)?);
+                    clear_main = Some(current);
+                }
+            }
         }
         let tmp = retired.with_file_name("evicted-order");
         fs::write(&tmp, serde_json::to_vec(&order)?)?;
         fs::rename(tmp, state)?;
+        // Persist the demotion before removing the last ref that identifies
+        // this candidate, so a second recovery can finish either operation.
+        if let Some(revision) = clear_main {
+            remove_recovered_ref(&repo.join("refs/main"), &revision)?;
+        }
     }
     // The journal is replayable until it is retired in one rename.
     fs::rename(journal, retired)?;
@@ -1741,15 +1994,10 @@ async fn mx_download_direct(
     Ok(path)
 }
 
-fn metadata_only_revisions(
-    cache: &Path,
-    repo: &Path,
-) -> anyhow::Result<std::collections::BTreeSet<String>> {
+fn hf_publication_order(cache: &Path, repo: &Path) -> anyhow::Result<HfRequestOrder> {
     let name = repo.file_name().context("HF repository has no name")?;
     let state = hf_publication_lock_path(&cache.join(".locks"), name).with_extension("order");
-    Ok(HfRequestOrder::read(&state)?
-        .metadata_only
-        .unwrap_or_default())
+    HfRequestOrder::read(&state)
 }
 
 fn offline_cached_model(
@@ -1764,15 +2012,10 @@ fn offline_cached_model(
     }
 
     if allow_provider_layout {
-        let metadata_only = metadata_only_revisions(cache, repo)?;
+        let order = hf_publication_order(cache, repo)?;
         for entry in recent_hf_snapshots(&repo.join("snapshots"))? {
             let entry = entry?;
-            if ignore_weights
-                || !entry
-                    .file_name()
-                    .to_str()
-                    .is_some_and(|rev| metadata_only.contains(rev))
-            {
+            if ignore_weights || !order.is_metadata_only(&entry.path())? {
                 return Ok(Some(entry.path()));
             }
         }
@@ -1973,7 +2216,8 @@ fn seed_hf_checkout(
                 }
                 _ => None,
             };
-            if checksum.is_none() && f.lfs.is_none() && f.blob_id.is_none() {
+            let has_hub_identity = f.lfs.is_some() || f.blob_id.is_some();
+            if checksum.is_none() && !has_hub_identity {
                 continue;
             }
             let Ok(metadata) = fs::metadata(&file) else {
@@ -1989,11 +2233,13 @@ fn seed_hf_checkout(
             if fs::hard_link(&file, &pinned).is_err() {
                 continue;
             }
-            if let Some(expected) = checksum {
-                if crate::model_card::verify_metadata_file(&pinned, expected).is_err() {
-                    fs::remove_file(pinned)?;
-                }
-            } else {
+            if let Some(expected) = checksum
+                && crate::model_card::verify_metadata_file(&pinned, expected).is_err()
+            {
+                fs::remove_file(pinned)?;
+                continue;
+            }
+            if has_hub_identity {
                 verified_candidates.push((pinned, f));
             }
         }
@@ -2775,6 +3021,7 @@ mod tests {
             revision: "custom".to_owned(),
             ticket: 2,
             kind: PublishedSnapshotKind::ProviderDefinedFull,
+            provider_files: Vec::new(),
         };
         assert!(published.should_keep(1, false, &main, root.path(), None)?);
         assert!(published.should_keep(3, true, &main, root.path(), None)?);
@@ -2902,6 +3149,7 @@ mod tests {
                     issued: 4,
                     main: Some(PublishedMain {
                         revision: revision.into(),
+                        provider_files: Vec::new(),
                         ticket,
                         kind: PublishedSnapshotKind::Full,
                     }),
@@ -3387,6 +3635,144 @@ mod tests {
         .await
     }
 
+    #[tokio::test]
+    #[serial_test::serial]
+    #[cfg(unix)]
+    async fn unreadable_supplemental_cache_allows_checked_card_online_fetch() -> anyhow::Result<()>
+    {
+        use crate::model_card::{ModelDeploymentCard, TokenizerKind};
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::Ordering;
+
+        let root = TempDir::new()?;
+        let home = root.path().join("home");
+        let cache = root.path().join("hf");
+        let supplemental = home.join(".model-express/cache");
+        let model = "org/unreadable-supplemental";
+        let folder = hf_hub::Repo::model(model.to_owned()).folder_name();
+        let expected = root.path().join("tokenizer.json");
+        fs::write(&expected, b"current")?;
+        let mut card = ModelDeploymentCard::with_name_only(model);
+        card.tokenizer = Some(TokenizerKind::HfTokenizerJson(CheckedFile::from_disk(
+            expected,
+        )?));
+        card.move_to_url(&format!("hf://{model}/"))?;
+
+        fs::create_dir_all(supplemental.join(".locks"))?;
+        let supplemental_lock =
+            hf_publication_lock_path(&supplemental.join(".locks"), OsStr::new(&folder));
+        fs::write(&supplemental_lock, b"")?;
+        fs::set_permissions(&supplemental_lock, fs::Permissions::from_mode(0o000))?;
+        let expected_error = match fs::File::open(&supplemental_lock) {
+            Err(error) => {
+                assert_eq!(error.kind(), ErrorKind::PermissionDenied);
+                ErrorKind::PermissionDenied
+            }
+            // A privileged CI process can read mode-000 files. Use a non-file
+            // lock entry to exercise the same root-inspection failure then.
+            Ok(_) => {
+                fs::remove_file(&supplemental_lock)?;
+                fs::create_dir(&supplemental_lock)?;
+                ErrorKind::Other
+            }
+        };
+
+        let revision = "cccccccccccccccccccccccccccccccccccccccc";
+        let server = serve_mx_test_server(revision, Default::default()).await?;
+        let mut hub = mockito::Server::new_async().await;
+        let endpoint = hub.url();
+        let api_route = format!("/api/models/{model}/revision/main");
+        let info = serde_json::json!({"id": model, "sha": revision, "siblings": [{"rfilename":"tokenizer.json"}]});
+        let lookup = hub
+            .mock("GET", api_route.as_str())
+            .with_body(info.to_string())
+            .create_async()
+            .await;
+        let tokenizer = hub
+            .mock(
+                "GET",
+                format!("/{model}/resolve/{revision}/tokenizer.json").as_str(),
+            )
+            .with_header("x-repo-commit", revision)
+            .with_header("etag", "currenttokenizer")
+            .with_body("current")
+            .expect_at_least(1)
+            .create_async()
+            .await;
+        let environment = |offline| {
+            [
+                ("HOME", Some(home.as_os_str())),
+                ("HF_HUB_CACHE", Some(cache.as_os_str())),
+                ("HF_ENDPOINT", Some(endpoint.as_ref())),
+                ("MODEL_EXPRESS_URL", Some(server.endpoint.as_ref())),
+                ("MODEL_EXPRESS_NO_SHARED_STORAGE", None),
+                ("HF_HUB_OFFLINE", offline),
+            ]
+        };
+
+        temp_env::async_with_vars(environment(Some(OsStr::new("1"))), async {
+            let error = card.clone().download_config(None).await.unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<io::Error>().unwrap().kind(),
+                expected_error
+            );
+            assert_eq!(server.ensure_calls.load(Ordering::Relaxed), 0);
+        })
+        .await;
+
+        temp_env::async_with_vars(environment(None), async {
+            let mut resolved = card.clone();
+            resolved.download_config(None).await?;
+            assert_eq!(
+                fs::read(resolved.local_dir().join("tokenizer.json"))?,
+                b"current"
+            );
+            assert_eq!(
+                fs::read(
+                    cache
+                        .join(&folder)
+                        .join("snapshots")
+                        .join(revision)
+                        .join("tokenizer.json")
+                )?,
+                b"current"
+            );
+            assert_eq!(server.ensure_calls.load(Ordering::Relaxed), 1);
+            assert_eq!(server.stream_calls.load(Ordering::Relaxed), 0);
+            lookup.assert_async().await;
+            tokenizer.assert_async().await;
+            lookup.remove_async().await;
+
+            // Force another cold checkout lookup and reject the direct request too.
+            fs::remove_dir_all(cache.join(&folder))?;
+            let unavailable = hub
+                .mock("GET", api_route.as_str())
+                .with_status(503)
+                .create_async()
+                .await;
+            let failure = card.clone().download_config(None).await.unwrap_err();
+            let diagnostic = format!("{failure:#}");
+            assert!(
+                diagnostic.contains(&supplemental.display().to_string()),
+                "{diagnostic}"
+            );
+            assert!(diagnostic.contains("503"), "{diagnostic}");
+            assert_eq!(server.ensure_calls.load(Ordering::Relaxed), 2);
+            unavailable.assert_async().await;
+
+            // An invalid lock in the destination cache remains fatal.
+            let preferred_lock =
+                hf_publication_lock_path(&cache.join(".locks"), OsStr::new(&folder));
+            fs::remove_file(&preferred_lock)?;
+            fs::create_dir(&preferred_lock)?;
+            let error = card.download_config(None).await.unwrap_err();
+            assert!(format!("{error:#}").contains(&cache.display().to_string()));
+            assert_eq!(server.ensure_calls.load(Ordering::Relaxed), 2);
+            anyhow::Ok(())
+        })
+        .await
+    }
+
     #[test]
     fn alternate_directory_scan_retains_an_entry_error_until_a_hit() -> anyhow::Result<()> {
         let root = TempDir::new()?;
@@ -3582,6 +3968,7 @@ mod tests {
                         ticket,
                         revision: revision.to_owned(),
                         kind: PublishedSnapshotKind::Full,
+                        provider_files: Vec::new(),
                     }),
                     metadata_only: Some(["unrelated".to_owned()].into_iter().collect()),
                     ..Default::default()
@@ -3662,6 +4049,7 @@ mod tests {
                     issued: 8,
                     main: Some(PublishedMain {
                         ticket: 6,
+                        provider_files: Vec::new(),
                         revision: old_main.to_owned(),
                         kind: PublishedSnapshotKind::Full,
                     }),
@@ -3674,6 +4062,7 @@ mod tests {
                         .into_iter()
                         .map(|revision| (revision.to_owned(), vec!["vocab.json".to_owned()]))
                         .collect(),
+                    ..Default::default()
                 })?,
             )?;
             if !old_main_evicted {
@@ -3742,6 +4131,7 @@ mod tests {
             before.main = Some(PublishedMain {
                 ticket,
                 revision: existing.file_name().unwrap().to_str().unwrap().to_owned(),
+                provider_files: Vec::new(),
                 kind: PublishedSnapshotKind::Full,
             });
             fs::create_dir(&journal)?;
@@ -3883,6 +4273,183 @@ mod tests {
             },
         )
         .await
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn metadata_marker_tracks_the_installed_checkout_and_provider_refill() -> anyhow::Result<()> {
+        let cache = TempDir::new()?;
+        let model = "org/refilled";
+        let folder = hf_hub::Repo::model(model.to_owned()).folder_name();
+        let repo = cache.path().join(&folder);
+        temp_env::with_vars(
+            [
+                ("HF_HUB_CACHE", Some(cache.path().as_os_str())),
+                ("HOME", Some(cache.path().as_os_str())),
+            ],
+            || {
+                for replace in [false, true] {
+                    let stage = TempDir::new_in(cache.path())?;
+                    let staged =
+                        build_hf_cache(stage.path(), model, &["config.json", "tokenizer.json"]);
+                    let rev = staged.file_name().unwrap().to_str().unwrap();
+                    let path = publish_streamed_hf_snapshot(
+                        stage.path(),
+                        &staged,
+                        cache.path(),
+                        Some(rev),
+                        SnapshotRequest::Model {
+                            ignore_weights: true,
+                        },
+                    )?;
+                    if replace {
+                        fs::rename(&path, stage.path().join("evicted"))?;
+                        fs::create_dir(&path)?;
+                        fs::write(path.join("config.json"), "{}")?;
+                        fs::write(path.join("tokenizer.json"), "{}")?;
+                    }
+                    fs::write(path.join("README.md"), "metadata")?;
+                    fs::write(path.join("metrics.csv"), "metadata")?;
+                    fs::write(path.join("notes.pdf"), "metadata")?;
+                    fs::write(
+                        path.join("model-00001-of-00002.safetensors"),
+                        "partial shard",
+                    )?;
+                    fs::write(path.join("config.json"), "different metadata")?;
+                    assert!(
+                        offline_cached_model(cache.path(), &repo, model, false, true)?.is_none()
+                    );
+                    assert!(shared_hf_revision(&folder, rev, &FULL_MODEL, Some(&path)).is_err());
+                    fs::write(path.join("custom.weights"), b"")?;
+                    assert!(
+                        offline_cached_model(cache.path(), &repo, model, false, true)?.is_none()
+                    );
+                    assert!(shared_hf_revision(&folder, rev, &FULL_MODEL, Some(&path)).is_err());
+                    fs::write(path.join("custom.weights"), "provider payload")?;
+                    assert_eq!(
+                        offline_cached_model(cache.path(), &repo, model, false, true)?,
+                        Some(path.clone())
+                    );
+                    assert_eq!(
+                        shared_hf_revision(&folder, rev, &FULL_MODEL, Some(&path))?,
+                        path
+                    );
+                    let state = hf_publication_lock_path(
+                        &cache.path().join(".locks"),
+                        repo.file_name().unwrap(),
+                    )
+                    .with_extension("order");
+                    fs::write(
+                        &state,
+                        serde_json::to_vec(
+                            &serde_json::json!({"issued": 1, "main": {"ticket": 1, "revision": rev, "kind": "Metadata"}}),
+                        )?,
+                    )?;
+                    // Old order files cannot distinguish this refill from custom files
+                    // that the original metadata transfer already contained.
+                    assert!(
+                        offline_cached_model(cache.path(), &repo, model, false, true)?.is_none()
+                    );
+                    fs::remove_dir_all(path)?;
+                }
+                anyhow::Ok(())
+            },
+        )
+    }
+
+    #[test]
+    fn rollback_full_main_requires_weights_after_replay() -> anyhow::Result<()> {
+        for (provider, already_full) in [(false, false), (true, false), (true, true)] {
+            let root = TempDir::new()?;
+            let model = "org/interrupted";
+            let snapshot = build_hf_cache(root.path(), model, &["config.json", "tokenizer.json"]);
+            let repo = snapshot.parent().unwrap().parent().unwrap();
+            let rev = snapshot.file_name().unwrap().to_str().unwrap();
+            let lock =
+                hf_publication_lock_path(&root.path().join(".locks"), repo.file_name().unwrap());
+            fs::create_dir_all(lock.parent().unwrap())?;
+            let journal = lock.with_extension("merge");
+            let state = lock.with_extension("order");
+            let weights = snapshot.join(if provider {
+                "custom.weights"
+            } else {
+                "model.safetensors"
+            });
+            fs::create_dir(&journal)?;
+            fs::write(&weights, b"interrupted payload")?;
+            if already_full {
+                fs::write(journal.join("0.old"), b"existing payload")?;
+            }
+            fs::write(
+                journal.join("manifest"),
+                serde_json::to_vec(&[
+                    (weights.strip_prefix(repo)?, already_full),
+                    (Path::new("refs/main"), true),
+                    (Path::new(HF_ORDER_FILE), true),
+                ])?,
+            )?;
+            fs::write(journal.join("1.old"), "evicted")?;
+            let previous = HfRequestOrder {
+                issued: 7,
+                main: Some(PublishedMain {
+                    ticket: 1,
+                    revision: "evicted".into(),
+                    provider_files: Vec::new(),
+                    kind: PublishedSnapshotKind::Full,
+                }),
+                metadata_only: Some(
+                    (!already_full)
+                        .then(|| rev.to_owned())
+                        .into_iter()
+                        .collect(),
+                ),
+                ..Default::default()
+            };
+            fs::write(journal.join("2.old"), serde_json::to_vec(&previous)?)?;
+            let next = HfRequestOrder {
+                issued: 7,
+                main: Some(PublishedMain {
+                    ticket: 7,
+                    revision: rev.to_owned(),
+                    provider_files: vec![
+                        "config.json".into(),
+                        weights.file_name().unwrap().to_str().unwrap().into(),
+                    ],
+                    kind: if provider {
+                        PublishedSnapshotKind::ProviderDefinedFull
+                    } else {
+                        PublishedSnapshotKind::Full
+                    },
+                }),
+                ..Default::default()
+            };
+            fs::write(&state, serde_json::to_vec(&next)?)?;
+            rollback_snapshot_merge(repo, &journal, &root.path().join("retired"))?;
+            let main = repo.join("refs/main");
+            assert_eq!(main.exists(), already_full);
+            assert_eq!(
+                HfRequestOrder::read(&state)?.main.map(|m| m.ticket),
+                already_full.then_some(7)
+            );
+            assert_eq!(
+                offline_cached_model(root.path(), repo, model, false, true)?.is_some(),
+                already_full
+            );
+            if !already_full {
+                // A second worker can arrive after the repaired order has been
+                // installed but before the first worker removed refs/main.
+                fs::write(&main, rev)?;
+                fs::rename(root.path().join("retired"), &journal)?;
+                rollback_snapshot_merge(repo, &journal, &root.path().join("retired"))?;
+                assert!(!main.exists());
+                assert!(HfRequestOrder::read(&state)?.main.is_none());
+                remove_recovered_ref(&main, rev)?;
+                fs::write(&main, "externally-updated")?;
+                remove_recovered_ref(&main, rev)?;
+                assert_eq!(fs::read(&main)?, b"externally-updated");
+            }
+        }
+        Ok(())
     }
 
     #[tokio::test]
@@ -4364,6 +4931,76 @@ mod tests {
             },
         )
         .await
+    }
+
+    #[test]
+    fn checked_seed_requires_every_available_identity() -> anyhow::Result<()> {
+        let cache = TempDir::new()?;
+        let stage = TempDir::new()?;
+        let names = [
+            "config.json",
+            "tokenizer.json",
+            "special_tokens_map.json",
+            "tokenizer_config.json",
+        ];
+        let source = build_hf_cache(cache.path(), "org/checked-seed", &names);
+        let repo = hf_snapshot_repo(&source)?;
+        let metadata = CheckedFile::from_disk(source.join("config.json"))?;
+        let different = stage.path().join("other.json");
+        fs::write(&different, b"[]")?;
+        let wrong_card = CheckedFile::from_disk(different)?;
+        let request = SnapshotRequest::CheckedMetadata {
+            files: names
+                .into_iter()
+                .map(|name| {
+                    let expected = if name == "tokenizer_config.json" {
+                        &wrong_card
+                    } else {
+                        &metadata
+                    };
+                    (name.to_owned(), expected.clone())
+                })
+                .collect::<Vec<_>>()
+                .into(),
+            blobs: stage.path().join("blobs"),
+        };
+        let revision = source.file_name().unwrap().to_str().unwrap();
+        // Git blob ID of the two bytes "{}".
+        let valid = "9e26dfeeb6e641a33dae4961196235bdb965b21b";
+        let info = HfSeedManifest {
+            sha: revision.to_owned(),
+            siblings: names
+                .into_iter()
+                .zip([
+                    None,
+                    Some("0000000000000000000000000000000000000000"),
+                    Some(valid),
+                    Some(valid),
+                ])
+                .map(|(name, blob)| HfSeedFile {
+                    rfilename: name.to_owned(),
+                    blob_id: blob.map(str::to_owned),
+                    lfs: None,
+                })
+                .collect(),
+        };
+        let stage_repo = stage.path().join("repo");
+        seed_hf_checkout(repo, &stage_repo, &info, &request)?;
+        let seeded = stage_repo.join("snapshots").join(revision);
+        assert!(seeded.join("config.json").is_file(), "card-only match");
+        assert!(
+            !seeded.join("tokenizer.json").exists(),
+            "Hub identity mismatch"
+        );
+        assert!(
+            seeded.join("special_tokens_map.json").is_file(),
+            "both identities match"
+        );
+        assert!(
+            !seeded.join("tokenizer_config.json").exists(),
+            "card identity mismatch"
+        );
+        Ok(())
     }
 
     #[test]

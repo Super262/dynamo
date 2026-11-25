@@ -814,6 +814,7 @@ fn file_uri_parent(uri: &str) -> Option<PathBuf> {
 fn sibling_paths(
     snapshot_dir: &Path,
     typed_filenames: &std::collections::HashSet<String>,
+    require_loaders: bool,
 ) -> anyhow::Result<Vec<(String, PathBuf)>> {
     let entries = match std::fs::read_dir(snapshot_dir) {
         Ok(e) => e,
@@ -822,20 +823,38 @@ fn sibling_paths(
             return Ok(Vec::new());
         }
     };
-    collect_sibling_paths(entries, typed_filenames)
+    collect_sibling_paths(entries, typed_filenames, require_loaders)
 }
 
 fn collect_sibling_paths(
     entries: std::fs::ReadDir,
     typed_filenames: &std::collections::HashSet<String>,
+    require_loaders: bool,
 ) -> anyhow::Result<Vec<(String, PathBuf)>> {
     let mut siblings = Vec::new();
     for entry in entries {
-        let path = entry?.path();
+        let entry = entry?;
+        let path = entry.path();
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        if !typed_filenames.contains(name) && !is_weight_file(&path) && path.is_file() {
+        if typed_filenames.contains(name) || is_weight_file(&path) {
+            continue;
+        }
+        let candidate = if require_loaders && is_legacy_loader_sibling(name) {
+            // Keep an observed loader on the candidate list even if its name
+            // or symlink target vanished. Opening the selected source must fail.
+            match entry.file_type() {
+                Ok(kind) => kind.is_file() || kind.is_symlink(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+                Err(error) => {
+                    return Err(error).with_context(|| format!("Inspecting {}", path.display()));
+                }
+            }
+        } else {
+            path.is_file()
+        };
+        if candidate {
             siblings.push((name.to_owned(), path));
         }
     }
@@ -850,7 +869,7 @@ fn harvest_siblings(
 ) -> anyhow::Result<()> {
     // Re-resolving a card turns its advertised paths into file:// URLs.
     // Never turn its already-local siblings into links to themselves.
-    let siblings = sibling_paths(snapshot_dir, typed_filenames)?;
+    let siblings = sibling_paths(snapshot_dir, typed_filenames, false)?;
     if siblings.is_empty() || same_file::is_same_file(snapshot_dir, local_dir)? {
         return Ok(());
     }
@@ -884,24 +903,33 @@ async fn resolve_hf_metadata_snapshot(
     let folder = hf_hub::Repo::model(repo.to_owned()).folder_name();
     let blobs = blobs.to_owned();
     let typed = typed.clone();
-    let (cached, files, blobs, typed, retained) = tokio::task::spawn_blocking(move || {
-        let cached = crate::hub::first_cache_hit(crate::hub::hf_cache_roots().map(|root| {
-            let repo_dir = root.join(&folder);
-            crate::hub::read_hf_checkout(&repo_dir, || {
-                cached_metadata_snapshot(&repo_dir, &files, &blobs)?
-                    .map(|dir| capture_checked_checkout(&dir, &files, &blobs, &typed, &retained))
-                    .transpose()
-            })
-        }))?;
-        anyhow::Ok((cached, files, blobs, typed, retained))
-    })
-    .await??;
+    let (cached, supplemental_error, files, blobs, typed, retained) =
+        tokio::task::spawn_blocking(move || {
+            let (cached, supplemental_error) = crate::hub::checked_hf_cache_hit(|root| {
+                let repo_dir = root.join(&folder);
+                crate::hub::read_hf_checkout(&repo_dir, || {
+                    cached_metadata_snapshot(&repo_dir, &files, &blobs)?
+                        .map(|dir| {
+                            capture_checked_checkout(&dir, &files, &blobs, &typed, &retained)
+                        })
+                        .transpose()
+                })
+            })?;
+            anyhow::Ok((cached, supplemental_error, files, blobs, typed, retained))
+        })
+        .await??;
     if let Some(cached) = cached {
         return Ok(cached);
     }
 
-    let path =
-        crate::hub::snapshot_for_checked_metadata(repo, files.clone(), blobs.clone()).await?;
+    let path = crate::hub::snapshot_for_checked_metadata(repo, files.clone(), blobs.clone())
+        .await
+        .map_err(|error| match supplemental_error {
+            Some(inspection_error) => error.context(format!(
+                "Supplemental Hugging Face cache inspection also failed: {inspection_error:#}"
+            )),
+            None => error,
+        })?;
     tokio::task::spawn_blocking(move || {
         crate::hub::read_hf_checkout(crate::hub::hf_snapshot_repo(&path)?, || {
             matching_metadata_files(&path, &files, Some(&blobs))?;
@@ -971,7 +999,7 @@ fn capture_metadata(
     typed: &std::collections::HashSet<String>,
     retained: &std::collections::HashSet<String>,
 ) -> anyhow::Result<Vec<CapturedMetadataFile>> {
-    let mut paths = collect_sibling_paths(std::fs::read_dir(dir)?, typed)?;
+    let mut paths = collect_sibling_paths(std::fs::read_dir(dir)?, typed, true)?;
     paths.sort_unstable_by(|(a, _), (b, _)| {
         (!is_legacy_loader_sibling(a), a).cmp(&(!is_legacy_loader_sibling(b), b))
     });
@@ -988,7 +1016,7 @@ fn capture_metadata(
         if !loader && !replaces && auxiliary_count >= MAX_HF_AUXILIARY_HANDLES {
             continue;
         }
-        let file = match open_metadata_file(&path, false) {
+        let file = match open_sibling_file(&path, loader) {
             Ok(Some(file)) => file,
             Ok(None) => continue,
             Err(error)
@@ -1066,6 +1094,21 @@ fn open_metadata_file(path: &Path, advertised: bool) -> anyhow::Result<Option<st
     }
 }
 
+fn open_sibling_file(path: &Path, loader: bool) -> anyhow::Result<Option<std::fs::File>> {
+    let file = open_metadata_file(path, loader)?;
+    if let Some(file) = file
+        && file.metadata()?.is_file()
+    {
+        return Ok(Some(file));
+    }
+    anyhow::ensure!(
+        !loader,
+        "Loader metadata sibling {} became unavailable; retry resolving the model card",
+        path.display()
+    );
+    Ok(None)
+}
+
 fn copy_captured_file(
     mut file: impl std::io::Read,
     dest: &Path,
@@ -1126,7 +1169,7 @@ fn copy_generation_siblings(
         let file = match source {
             MetadataSibling::Checkout(file) => file,
             MetadataSibling::Local(path) => {
-                let Some(file) = open_metadata_file(&path, false)? else {
+                let Some(file) = open_sibling_file(&path, is_legacy_loader_sibling(&name))? else {
                     continue;
                 };
                 file
@@ -1150,6 +1193,34 @@ fn copy_generation_siblings(
         }
     }
     Ok(())
+}
+
+fn copy_checked_generation_file(
+    blob: &Path,
+    dest: &Path,
+    expected: &CheckedFile,
+) -> anyhow::Result<()> {
+    // The opened inode survives cache eviction. Verify the private copy before
+    // it becomes part of a generation, even if the source name was replaced.
+    let file = open_metadata_file(blob, true)?.with_context(|| {
+        format!(
+            "MDC blob {} disappeared before publication; retry resolving the model card",
+            blob.display()
+        )
+    })?;
+    let metadata = file.metadata()?;
+    let cap = metadata_byte_cap(expected);
+    anyhow::ensure!(
+        metadata.is_file() && metadata.len() <= cap,
+        "MDC blob {} is not a regular file within the metadata size cap",
+        blob.display()
+    );
+    anyhow::ensure!(
+        copy_captured_file(file, dest, cap)?.is_some(),
+        "MDC blob {} exceeds the metadata size cap",
+        blob.display()
+    );
+    verify_metadata_file(dest, expected)
 }
 
 fn mdc_generation_digest(dir: &Path) -> anyhow::Result<blake3::Hash> {
@@ -2683,7 +2754,7 @@ impl ModelDeploymentCard {
             .timeout(std::time::Duration::from_secs(300))
             .build()
             .context("building http client for metadata fetch")?;
-        let mut typed_links = Vec::new();
+        let mut typed_files = Vec::new();
         for (uri, expected) in &entries {
             let filename = uri_basename(uri)?;
             // Hash is validated at MDC deserialize; safe as a path component.
@@ -2693,7 +2764,7 @@ impl ModelDeploymentCard {
             if !uri.starts_with("hf://") {
                 resolve_uri(&client, uri, expected, &blob).await?;
             }
-            typed_links.push((filename, blob));
+            typed_files.push((filename, blob, expected.clone()));
         }
         tracing::debug!(
             display_name = %self.display_name,
@@ -2710,25 +2781,22 @@ impl ModelDeploymentCard {
             .filter_map(|(uri, _)| file_uri_parent(uri))
             .collect();
         let local_dir = tokio::task::spawn_blocking(move || {
-            let staged = if !has_hf_checkout {
+            if !has_hf_checkout {
                 std::fs::create_dir_all(&local_dir)?;
-                None
-            } else {
-                std::fs::create_dir_all(&generations)?;
-                Some(tempfile::tempdir_in(&generations)?)
-            };
-            let publish_dir = staged
-                .as_ref()
-                .map_or(local_dir.as_path(), |dir| dir.path());
-            for (name, blob) in typed_links {
-                symlink_force(&blob, &publish_dir.join(name))?;
-            }
-            let Some(staged) = staged else {
+                for (name, blob, _) in typed_files {
+                    symlink_force(&blob, &local_dir.join(name))?;
+                }
                 for snap in snapshot_dirs {
                     harvest_siblings(&snap, &local_dir, &typed_filenames)?;
                 }
                 return Ok(local_dir);
-            };
+            }
+
+            std::fs::create_dir_all(&generations)?;
+            let staged = tempfile::tempdir_in(&generations)?;
+            for (name, blob, expected) in typed_files {
+                copy_checked_generation_file(&blob, &staged.path().join(name), &expected)?;
+            }
 
             let mut siblings = std::collections::BTreeMap::new();
             for snap in snapshot_dirs {
@@ -2736,7 +2804,7 @@ impl ModelDeploymentCard {
                 if local_dir.is_dir() && same_file::is_same_file(&snap, &local_dir)? {
                     continue;
                 }
-                for (name, path) in sibling_paths(&snap, &typed_filenames)? {
+                for (name, path) in sibling_paths(&snap, &typed_filenames, true)? {
                     siblings.insert(name, MetadataSibling::Local(path));
                 }
             }
@@ -2755,8 +2823,7 @@ impl ModelDeploymentCard {
         })
         .await??;
 
-        // Pass 3: rewrite cf.path to the cache symlink so downstream
-        // tokenizer/config loaders read from a verified location.
+        // Point downstream tokenizer/config loaders at the resolved files.
         for (cf, _) in self.iter_metadata_files_mut() {
             cf.update_dir(&local_dir);
         }
@@ -4111,6 +4178,45 @@ mod tests {
     }
 
     #[test]
+    fn generation_rejects_a_disappearing_loader_sibling() -> anyhow::Result<()> {
+        use super::MetadataSibling::Local;
+        use std::fs;
+
+        let root = tempfile::tempdir()?;
+        let loader = root.path().join("special_tokens_map.json");
+        let auxiliary = root.path().join("README.md");
+        let dest = root.path().join("generation");
+        fs::create_dir(&dest)?;
+        fs::write(&loader, b"loader metadata")?;
+        fs::write(&auxiliary, b"readme")?;
+        let siblings = [
+            ("README.md".to_owned(), Local(auxiliary.clone())),
+            ("special_tokens_map.json".to_owned(), Local(loader.clone())),
+        ]
+        .into();
+        fs::remove_file(&auxiliary)?;
+        super::copy_generation_siblings(
+            [("README.md".to_owned(), Local(auxiliary))].into(),
+            &dest,
+            64,
+            128,
+        )?;
+        fs::remove_file(&loader)?;
+        let error = super::copy_generation_siblings(siblings, &dest, 64, 128).unwrap_err();
+        assert!(format!("{error:#}").contains("Loader metadata sibling"));
+        assert_eq!(fs::read_dir(dest)?.count(), 0);
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("evicted-blob", loader)?;
+            let error =
+                super::capture_metadata(root.path(), &Default::default(), &Default::default())
+                    .unwrap_err();
+            assert!(format!("{error:#}").contains("Loader metadata sibling"));
+        }
+        Ok(())
+    }
+
+    #[test]
     fn sibling_stream_over_limit_leaves_destination_unchanged() -> anyhow::Result<()> {
         let root = tempfile::tempdir()?;
         let dest = root.path().join("sibling");
@@ -4571,6 +4677,106 @@ mod tests {
         .await
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn old_generation_reuses_live_checked_links_and_rejects_dangling_ones() -> anyhow::Result<()> {
+        use std::fs;
+
+        let root = tempfile::tempdir()?;
+        let source = root.path().join("config.json");
+        fs::write(&source, b"checked config")?;
+        let mut checked = CheckedFile::from_disk(&source)?;
+        let staged = tempfile::tempdir_in(root.path())?;
+        super::symlink_force(&source, &staged.path().join("config.json"))?;
+        let dir = super::publish_mdc_generation(staged, root.path())?;
+        checked.update_dir(&dir);
+        super::verify_mdc_generation(&dir, std::slice::from_ref(&checked))?;
+
+        fs::remove_file(source)?;
+        assert!(fs::symlink_metadata(dir.join("config.json"))?.is_symlink());
+        let error = super::verify_mdc_generation(&dir, &[checked]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("re-resolve the original model card")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn first_generation_rejects_a_checked_blob_evicted_during_resolution()
+    -> anyhow::Result<()> {
+        use std::fs;
+
+        let home = tempfile::tempdir()?;
+        let cache = home.path().join("hub");
+        let snapshot = cache.join("models--org--model/snapshots/a");
+        fs::create_dir_all(&snapshot)?;
+        fs::write(snapshot.join("config.json"), b"checked config")?;
+        fs::write(snapshot.join("tokenizer.json"), b"checked tokenizer")?;
+        let tokenizer = CheckedFile::from_disk(snapshot.join("tokenizer.json"))?;
+        let blob = home
+            .path()
+            .join(".cache/dynamo/mdc/blobs")
+            .join(tokenizer.checksum().hash());
+
+        let mut card = ModelDeploymentCard::with_name_only("org/model");
+        card.model_info = Some(super::ModelInfoType::HfConfigJson(CheckedFile::from_disk(
+            snapshot.join("config.json"),
+        )?));
+        card.tokenizer = Some(super::TokenizerKind::HfTokenizerJson(tokenizer));
+        card.move_to_url("hf://org/model/")?;
+
+        let mut server = mockito::Server::new_async().await;
+        let template = home.path().join("chat_template.jinja");
+        let body = b"{{ messages }}";
+        fs::write(&template, body)?;
+        let mut template = CheckedFile::from_disk(template)?;
+        template.move_to_url(url::Url::parse(&format!(
+            "{}/chat_template.jinja",
+            server.url()
+        ))?);
+        card.chat_template_file = Some(super::PromptFormatterArtifact::HfChatTemplateJinja {
+            is_custom: true,
+            file: template,
+        });
+        let to_evict = blob.clone();
+        let request = server
+            .mock("GET", "/chat_template.jinja")
+            .with_chunked_body(move |writer| {
+                fs::remove_file(&to_evict)?;
+                writer.write_all(body)
+            })
+            .create_async()
+            .await;
+
+        temp_env::async_with_vars(
+            [
+                ("HOME", Some(home.path().as_os_str())),
+                ("HF_HUB_CACHE", Some(cache.as_os_str())),
+                ("HF_HUB_OFFLINE", Some("1".as_ref())),
+                ("MODEL_EXPRESS_NO_SHARED_STORAGE", Some("1".as_ref())),
+            ],
+            async {
+                let result = card.download_config(None).await;
+                request.assert_async().await;
+                assert!(!blob.exists());
+                let error = match result {
+                    Ok(()) => anyhow::bail!("First publication returned a dangling tokenizer"),
+                    Err(error) => error,
+                };
+                assert!(format!("{error:#}").contains("MDC blob"));
+                let generations = super::mdc_hf_generations(&card.local_dir());
+                if generations.exists() {
+                    assert_eq!(fs::read_dir(generations)?.count(), 0);
+                }
+                Ok(())
+            },
+        )
+        .await
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn resolved_card_rejects_partial_eviction_without_mixing_hf_revisions()
@@ -4630,6 +4836,17 @@ mod tests {
                 );
 
                 let published = local.join("tokenizer.json");
+                assert!(fs::symlink_metadata(&published)?.is_file());
+                let blob = super::mdc_blobs_dir()?.join(tokenizer.checksum().hash());
+                fs::remove_file(&blob)?;
+                restored.download_config(None).await?;
+                assert_eq!(fs::read(&published)?, b"same tokenizer");
+                assert!(!blob.exists());
+
+                fs::write(&blob, b"bad tokenizer!")?;
+                restored.download_config(None).await?;
+                assert_eq!(fs::read(&published)?, b"same tokenizer");
+
                 fs::remove_file(&published)?;
                 let error = match restored.download_config(None).await {
                     Ok(()) => anyhow::bail!(
@@ -4647,26 +4864,12 @@ mod tests {
                 assert_eq!(restored.local_dir(), local);
                 assert!(!published.exists());
 
-                let blob = super::mdc_blobs_dir()?.join(tokenizer.checksum().hash());
-                super::symlink_force(&blob, &published)?;
+                fs::copy(a.join("tokenizer.json"), &published)?;
                 restored.download_config(None).await?;
-                #[cfg(unix)]
-                {
-                    fs::remove_file(&blob)?;
-                    assert!(fs::symlink_metadata(&published)?.is_symlink());
-                    let error = restored.download_config(None).await.unwrap_err();
-                    assert!(
-                        error
-                            .to_string()
-                            .contains("re-resolve the original model card")
-                    );
-                    assert!(!blob.exists());
-
-                    fs::write(&blob, b"bad tokenizer!")?;
-                    let error = restored.download_config(None).await.unwrap_err();
-                    assert!(format!("{error:#}").contains("checksum mismatch"));
-                    assert_eq!(fs::read(blob)?, b"bad tokenizer!");
-                }
+                fs::write(&published, b"bad tokenizer!")?;
+                let error = restored.download_config(None).await.unwrap_err();
+                assert!(format!("{error:#}").contains("Generation digest mismatch"));
+                assert_eq!(fs::read(&published)?, b"bad tokenizer!");
                 assert_eq!(restored.local_dir(), local);
                 assert_eq!(fs::read_dir(local.parent().unwrap())?.count(), 1);
                 assert_eq!(fs::read(main)?, b"b");
