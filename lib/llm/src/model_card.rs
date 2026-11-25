@@ -864,6 +864,102 @@ fn harvest_siblings(
     Ok(())
 }
 
+// A checked card can refer to a metadata-only revision even when refs/main
+// points to a different revision with weights. Select one checkout for all
+// advertised files so that harvested siblings also come from that revision.
+async fn resolve_hf_metadata_snapshot(
+    repo: &str,
+    files: Vec<(String, CheckedFile)>,
+    blobs: &Path,
+) -> anyhow::Result<Option<PathBuf>> {
+    let repo_dir = crate::hub::hf_repo_cache_dir(repo);
+    let blobs = blobs.to_owned();
+    let (files, cached, have_blobs) = tokio::task::spawn_blocking(move || {
+        let cached = cached_metadata_snapshot(&repo_dir, &files);
+        let have_blobs = cached.is_none()
+            && files
+                .iter()
+                .all(|(_, cf)| cached_blob_matches(&blobs.join(cf.checksum().hash()), cf));
+        (files, cached, have_blobs)
+    })
+    .await?;
+    if cached.is_some() || have_blobs {
+        return Ok(cached);
+    }
+    // Shared storage can return a checkout outside the standard HF cache layout.
+    let snapshot = crate::hub::snapshot_for_checked_metadata(repo).await?;
+    tokio::task::spawn_blocking(move || {
+        verify_metadata_snapshot(&snapshot, &files)?;
+        Ok(Some(snapshot))
+    })
+    .await?
+}
+
+fn cached_metadata_snapshot(repo_dir: &Path, files: &[(String, CheckedFile)]) -> Option<PathBuf> {
+    let snapshots = repo_dir.join("snapshots");
+    let main = std::fs::read_to_string(repo_dir.join("refs/main"))
+        .ok()
+        .filter(|rev| Path::new(rev).file_name() == Some(rev.as_ref()))
+        .map(|rev| snapshots.join(rev));
+    if let Some(path) = &main
+        && verify_metadata_snapshot(path, files).is_ok()
+    {
+        return main;
+    }
+    let mut candidates: Vec<_> = std::fs::read_dir(snapshots)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .map(|entry| entry.path())
+        .filter(|path| Some(path) != main.as_ref())
+        .collect();
+    candidates.sort_unstable();
+    candidates
+        .into_iter()
+        .find(|dir| verify_metadata_snapshot(dir, files).is_ok())
+}
+
+fn verify_metadata_snapshot(
+    snapshot: &Path,
+    files: &[(String, CheckedFile)],
+) -> anyhow::Result<()> {
+    for (name, expected) in files {
+        verify_metadata_file(&snapshot.join(name), expected)?;
+    }
+    Ok(())
+}
+
+fn verify_metadata_file(path: &Path, expected: &CheckedFile) -> anyhow::Result<()> {
+    let meta = std::fs::metadata(path).with_context(|| format!("reading {}", path.display()))?;
+    anyhow::ensure!(meta.is_file(), "{} is not a regular file", path.display());
+    anyhow::ensure!(
+        meta.len() <= metadata_byte_cap(expected),
+        "{} exceeds metadata size cap",
+        path.display()
+    );
+    let actual = CheckedFile::from_disk(path)?;
+    anyhow::ensure!(
+        actual.checksum() == expected.checksum(),
+        "checksum mismatch for {}: expected {}, got {}",
+        path.display(),
+        expected.checksum(),
+        actual.checksum()
+    );
+    Ok(())
+}
+
+// Already published blobs are addressed by digest and may be shared across cards.
+fn cached_blob_matches(path: &Path, expected: &CheckedFile) -> bool {
+    CheckedFile::from_disk(path).is_ok_and(|file| file.checksum() == expected.checksum())
+}
+
+fn metadata_byte_cap(expected: &CheckedFile) -> u64 {
+    expected
+        .size()
+        .unwrap_or(ABSOLUTE_MAX_METADATA_BYTES)
+        .min(ABSOLUTE_MAX_METADATA_BYTES)
+}
+
 /// Stage `uri` into `dest`, verifying staged bytes against `expected`
 /// before publishing. Schemes: `http(s)`, `file`, `hf`. For `hf://`,
 /// `hf_snapshots` must already contain the resolved repo path —
@@ -875,15 +971,12 @@ async fn resolve_uri(
     dest: &Path,
     hf_snapshots: &std::collections::HashMap<String, PathBuf>,
 ) -> anyhow::Result<()> {
-    let cap = expected
-        .size()
-        .unwrap_or(ABSOLUTE_MAX_METADATA_BYTES)
-        .min(ABSOLUTE_MAX_METADATA_BYTES);
+    let cap = metadata_byte_cap(expected);
 
     let parsed = url::Url::parse(uri).with_context(|| format!("parsing artifact uri: {uri}"))?;
 
     if dest.exists() {
-        if CheckedFile::from_disk(dest).is_ok_and(|cf| cf.checksum() == expected.checksum()) {
+        if cached_blob_matches(dest, expected) {
             return Ok(());
         }
         tracing::warn!(dest = %dest.display(), "MDC cache blob failed re-verification; refetching");
@@ -911,15 +1004,8 @@ async fn resolve_uri(
 
         // Re-blake3 the staged bytes via the same `from_disk` path the
         // worker used at registration so the comparison is bit-identical.
-        let actual = CheckedFile::from_disk(&tmp)?;
-        if actual.checksum() != expected.checksum() {
-            anyhow::bail!(
-                "checksum mismatch for {uri}: expected {}, got {}",
-                expected.checksum(),
-                actual.checksum()
-            );
-        }
-        Ok(())
+        verify_metadata_file(&tmp, expected)
+            .map_err(|error| anyhow::anyhow!("verifying {uri}: {error:#}"))
     })
     .await
 }
@@ -2123,22 +2209,23 @@ impl ModelDeploymentCard {
             entries.push((uri, cf.clone()));
         }
 
-        // Pre-resolve hf:// repos once per unique repo; otherwise the
-        // resolve loop would fetch the same snapshot for each checked file.
-        let mut hf_snapshots: std::collections::HashMap<String, PathBuf> =
-            std::collections::HashMap::new();
-        for (uri, _) in &entries {
+        let mut hf_files = std::collections::BTreeMap::<String, Vec<_>>::new();
+        for (uri, expected) in &entries {
             if uri.starts_with("hf://") {
-                let (repo, _) = parse_hf_uri(uri)?;
-                if let std::collections::hash_map::Entry::Vacant(e) = hf_snapshots.entry(repo) {
-                    let repo_name = e.key().clone();
-                    let snap = crate::hub::snapshot_for_checked_metadata(&repo_name)
-                        .await
-                        .with_context(|| {
-                            format!("Failed to resolve Hugging Face metadata for {repo_name}")
-                        })?;
-                    e.insert(snap);
-                }
+                let (repo, filename) = parse_hf_uri(uri)?;
+                hf_files
+                    .entry(repo)
+                    .or_default()
+                    .push((filename, expected.clone()));
+            }
+        }
+        let mut hf_snapshots = std::collections::HashMap::new();
+        for (repo, files) in hf_files {
+            if let Some(snapshot) = resolve_hf_metadata_snapshot(&repo, files, &blobs)
+                .await
+                .with_context(|| format!("Failed to resolve Hugging Face metadata for {repo}"))?
+            {
+                hf_snapshots.insert(repo, snapshot);
             }
         }
 
@@ -3491,6 +3578,70 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn download_config_selects_one_cached_revision_by_checksum() -> anyhow::Result<()> {
+        let home = tempfile::tempdir()?;
+        let cache = home.path().join("hub");
+        let repo = cache.join("models--org--model");
+        let main = repo.join("snapshots/a");
+        let metadata = repo.join("snapshots/b");
+        std::fs::create_dir_all(repo.join("refs"))?;
+        std::fs::write(repo.join("refs/main"), b"a")?;
+        for dir in [&main, &metadata] {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(main.join("config.json"), b"A")?;
+        std::fs::write(main.join("tokenizer.json"), b"T")?;
+        std::fs::write(main.join("model.safetensors"), b"weights")?;
+        std::fs::write(metadata.join("config.json"), b"B")?;
+        std::fs::write(metadata.join("tokenizer.json"), b"T")?;
+        std::fs::write(metadata.join("preprocessor_config.json"), b"from B")?;
+        let mut card = ModelDeploymentCard::with_name_only("org/model");
+        card.model_info = Some(super::ModelInfoType::HfConfigJson(CheckedFile::from_disk(
+            metadata.join("config.json"),
+        )?));
+        card.tokenizer = Some(super::TokenizerKind::HfTokenizerJson(
+            CheckedFile::from_disk(metadata.join("tokenizer.json"))?,
+        ));
+        card.move_to_url("hf://org/model/")?;
+
+        temp_env::async_with_vars(
+            [
+                ("HOME", Some(home.path().as_os_str())),
+                ("HF_HUB_CACHE", Some(cache.as_os_str())),
+                ("HF_HUB_OFFLINE", Some("1".as_ref())),
+                ("MODEL_EXPRESS_NO_SHARED_STORAGE", Some("1".as_ref())),
+                ("MODEL_EXPRESS_URL", Some("http://[".as_ref())),
+            ],
+            async {
+                // A and B each match one slot. Selecting them separately would assemble a mixed card.
+                std::fs::write(metadata.join("tokenizer.json"), b"X")?;
+                assert!(card.clone().download_config(None).await.is_err());
+                assert_eq!(std::fs::read_dir(super::mdc_blobs_dir()?)?.count(), 0);
+
+                std::fs::write(metadata.join("tokenizer.json"), b"T")?;
+                card.clone().download_config(None).await?;
+                let local = card.local_dir();
+                assert_eq!(std::fs::read(local.join("config.json"))?, b"B");
+                assert_eq!(std::fs::read(local.join("tokenizer.json"))?, b"T");
+                assert_eq!(
+                    std::fs::read(local.join("preprocessor_config.json"))?,
+                    b"from B"
+                );
+                assert_eq!(std::fs::read(repo.join("refs/main"))?, b"a");
+
+                // The typed, content-addressed blobs survive eviction of the HF checkout.
+                std::fs::remove_dir_all(&repo)?;
+                card.download_config(None).await?;
+                assert_eq!(std::fs::read(local.join("config.json"))?, b"B");
+                assert_eq!(std::fs::read(local.join("tokenizer.json"))?, b"T");
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn download_config_checks_native_hf_metadata_offline() -> anyhow::Result<()> {
         let home = tempfile::tempdir()?;
         let cache = home.path().join("hub");
@@ -3717,6 +3868,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn local_dir_computes_expected_path() {
         // Sentinel for cache-layout drift: the public `local_dir()` must
         // stay in lockstep with `mdc_local_path`. Resolve-pipeline

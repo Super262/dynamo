@@ -92,32 +92,60 @@ fn cached_file(path: &Path) -> io::Result<bool> {
 /// unless explicitly skipped. Preserve I/O errors for callers updating refs.
 fn has_required_model_files(dir: &Path, ignore_weights: bool) -> io::Result<bool> {
     let has = |filename: &str| cached_file(&dir.join(filename));
-    let metadata = match fs::metadata(dir.join("config.json")) {
-        Ok(config) => {
-            config.is_file()
-                && (has("tokenizer.json")? || has("tiktoken.model")? || has_tiktoken_file(dir)?)
-        }
-        Err(error) if error.kind() == ErrorKind::NotFound => {
-            has("params.json")? && has("tekken.json")?
-        }
-        Err(error) => return Err(error),
+    let native_metadata = || Ok(has("params.json")? && has("tekken.json")?);
+    let hf_metadata = || {
+        let tokenizers = ["tokenizer.json", "tiktoken.model"].into_iter().map(has);
+        Ok(has("config.json")?
+            && any_available(tokenizers.chain(std::iter::once_with(|| has_tiktoken_file(dir))))?)
     };
-    Ok(metadata
-        && (ignore_weights
-            || has("model.safetensors")?
-            || has("pytorch_model.bin")?
-            || shard_files_present(&dir.join("model.safetensors.index.json"))?
-            || shard_files_present(&dir.join("pytorch_model.bin.index.json"))?))
+    if !any_available(
+        std::iter::once_with(hf_metadata).chain(std::iter::once_with(native_metadata)),
+    )? {
+        return Ok(false);
+    }
+    if ignore_weights {
+        return Ok(true);
+    }
+
+    let weights = ["model.safetensors", "pytorch_model.bin"]
+        .into_iter()
+        .map(has)
+        .chain(std::iter::once_with(|| {
+            Ok(has("consolidated.safetensors")? && native_metadata()?)
+        }));
+    let indexes = [
+        "model.safetensors.index.json",
+        "pytorch_model.bin.index.json",
+    ]
+    .into_iter()
+    .map(|name| shard_files_present(&dir.join(name)));
+    any_available(weights.chain(indexes))
+}
+
+// An unreadable alternative matters only if none of the others is usable.
+fn any_available(checks: impl Iterator<Item = io::Result<bool>>) -> io::Result<bool> {
+    let mut first_error = None;
+    for check in checks {
+        match check {
+            Ok(true) => return Ok(true),
+            Ok(false) => {}
+            Err(error) => {
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+    first_error.map_or(Ok(false), Err)
 }
 
 fn has_tiktoken_file(dir: &Path) -> io::Result<bool> {
-    for entry in fs::read_dir(dir)? {
+    any_available(fs::read_dir(dir)?.map(|entry| {
         let path = entry?.path();
-        if path.extension().is_some_and(|ext| ext == "tiktoken") && cached_file(&path)? {
-            return Ok(true);
+        if path.extension().is_some_and(|ext| ext == "tiktoken") {
+            cached_file(&path)
+        } else {
+            Ok(false)
         }
-    }
-    Ok(false)
+    }))
 }
 
 /// An index counts as weights only when every referenced shard is present.
@@ -140,7 +168,15 @@ fn shard_files_present(index_path: &Path) -> io::Result<bool> {
         let Some(name) = shard.as_str() else {
             return Ok(false);
         };
-        if checked.insert(name) && !cached_file(&snapshot_dir.join(name))? {
+        let shard = Path::new(name);
+        if shard.as_os_str().is_empty()
+            || shard
+                .components()
+                .any(|c| !matches!(c, Component::Normal(_) | Component::CurDir))
+        {
+            return Ok(false);
+        }
+        if checked.insert(name) && !cached_file(&snapshot_dir.join(shard))? {
             return Ok(false);
         }
     }
@@ -173,9 +209,24 @@ pub async fn from_hf(name: impl AsRef<Path>, ignore_weights: bool) -> anyhow::Re
     fetch_snapshot(name.as_ref(), SnapshotRequest::Model { ignore_weights }).await
 }
 
+#[derive(Clone, Copy)]
 enum SnapshotRequest {
     Model { ignore_weights: bool },
     CheckedMetadata,
+}
+
+impl SnapshotRequest {
+    fn ignore_weights(self) -> bool {
+        match self {
+            Self::Model { ignore_weights } => ignore_weights,
+            Self::CheckedMetadata => true,
+        }
+    }
+}
+
+pub(super) fn hf_repo_cache_dir(repo: &str) -> PathBuf {
+    get_model_express_cache_dir(MxModelProvider::HuggingFace)
+        .join(hf_hub::Repo::model(repo.to_owned()).folder_name())
 }
 
 pub(super) async fn snapshot_for_checked_metadata(repo: &str) -> anyhow::Result<PathBuf> {
@@ -183,16 +234,15 @@ pub(super) async fn snapshot_for_checked_metadata(repo: &str) -> anyhow::Result<
 }
 
 async fn fetch_snapshot(name: &Path, request: SnapshotRequest) -> anyhow::Result<PathBuf> {
-    let ignore_weights = match request {
-        SnapshotRequest::Model { ignore_weights } => ignore_weights,
-        SnapshotRequest::CheckedMetadata => true,
-    };
+    let ignore_weights = request.ignore_weights();
     let model_name = name.display().to_string();
     let provider = provider_for(&model_name);
 
     // Cache-first in all modes: if the snapshot is already on disk with the files we
     // need, return it without touching the network.
-    if let Some(cached_path) = get_cached_model_path(&model_name, provider, ignore_weights) {
+    if matches!(request, SnapshotRequest::Model { .. })
+        && let Some(cached_path) = get_cached_model_path(&model_name, provider, ignore_weights)
+    {
         return Ok(cached_path);
     }
 
@@ -211,7 +261,7 @@ async fn fetch_snapshot(name: &Path, request: SnapshotRequest) -> anyhow::Result
     let result = match mx_download_from_server(
         &model_name,
         provider,
-        ignore_weights,
+        request,
         config,
         hf_stream_cache.as_deref(),
     )
@@ -275,7 +325,7 @@ fn mx_client_config(provider: MxModelProvider) -> MxClientConfig {
 async fn mx_download_from_server(
     model_name: &str,
     provider: MxModelProvider,
-    ignore_weights: bool,
+    request: SnapshotRequest,
     mut config: MxClientConfig,
     hf_stream_cache: Option<&Path>,
 ) -> anyhow::Result<PathBuf> {
@@ -296,7 +346,7 @@ async fn mx_download_from_server(
     let mut client = MxClient::new(config).await?;
     tracing::info!("Successfully connected to ModelExpress server");
     let download = client
-        .request_model_revision(model_name, provider, ignore_weights, None)
+        .request_model_revision(model_name, provider, request.ignore_weights(), None)
         .await?;
     tracing::info!("Server download succeeded for model: {model_name}");
 
@@ -310,7 +360,7 @@ async fn mx_download_from_server(
                 &snapshot,
                 &cache,
                 download.resolved_revision.as_deref(),
-                ignore_weights,
+                request,
             )
         })
         .await?;
@@ -439,7 +489,7 @@ fn publish_streamed_hf_snapshot(
     snapshot: &Path,
     cache: &Path,
     resolved_revision: Option<&str>,
-    ignore_weights: bool,
+    request: SnapshotRequest,
 ) -> anyhow::Result<PathBuf> {
     let relative = snapshot.strip_prefix(staging)?;
     let components: Vec<_> = relative.components().collect();
@@ -459,6 +509,17 @@ fn publish_streamed_hf_snapshot(
         anyhow::ensure!(
             revision == expected,
             "Streamed Hugging Face snapshot {} does not match resolved revision {expected}",
+            snapshot.display()
+        );
+    }
+
+    if let SnapshotRequest::Model { ignore_weights } = request {
+        anyhow::ensure!(
+            has_required_model_files(snapshot, ignore_weights).with_context(|| format!(
+                "Failed to inspect streamed snapshot {}",
+                snapshot.display()
+            ))?,
+            "Streamed Hugging Face snapshot at {} is incomplete",
             snapshot.display()
         );
     }
@@ -506,7 +567,7 @@ fn publish_streamed_hf_snapshot(
     }
     // Update the ref only after the snapshot files have been published.
     let main_ref = refs.join("main");
-    let preserve_main = ignore_weights && main_has_complete_snapshot(&main_ref, &snapshots)
+    let preserve_main = request.ignore_weights() && main_has_complete_snapshot(&main_ref, &snapshots)
         .unwrap_or_else(|error| {
             tracing::warn!(path = %main_ref.display(), %error, "Preserving the current ref because snapshot validation failed");
             true
@@ -620,6 +681,10 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    const FULL_MODEL: SnapshotRequest = SnapshotRequest::Model {
+        ignore_weights: false,
+    };
 
     #[serial_test::serial]
     #[test]
@@ -757,7 +822,7 @@ mod tests {
             &snapshot,
             cache.path(),
             Some("1111111111111111111111111111111111111111"),
-            false,
+            FULL_MODEL,
         )
         .unwrap_err();
 
@@ -767,6 +832,44 @@ mod tests {
                 .contains("does not match resolved revision")
         );
         assert!(!cache.path().join("models--org--model").exists());
+    }
+
+    #[test]
+    fn incomplete_stream_leaves_the_existing_snapshot_and_ref_untouched() {
+        let cache = TempDir::new().unwrap();
+        let staging = TempDir::new().unwrap();
+        let model = "org/model";
+        let existing = build_hf_cache(
+            cache.path(),
+            model,
+            &["config.json", "tokenizer.json", "model.safetensors"],
+        );
+        let source = build_hf_cache(staging.path(), model, &["config.json", "tokenizer.json"]);
+        fs::write(source.join("config.json"), b"replacement").unwrap();
+
+        let publish = |snapshot: &Path| {
+            publish_streamed_hf_snapshot(staging.path(), snapshot, cache.path(), None, FULL_MODEL)
+        };
+        assert!(
+            publish(&source)
+                .unwrap_err()
+                .to_string()
+                .contains("incomplete")
+        );
+        assert_eq!(fs::read(existing.join("config.json")).unwrap(), b"{}");
+        let other = source.with_file_name("other");
+        fs::rename(source, &other).unwrap();
+        assert!(
+            publish(&other)
+                .unwrap_err()
+                .to_string()
+                .contains("incomplete")
+        );
+        assert!(!existing.with_file_name("other").exists());
+        assert_eq!(
+            get_cached_model_path_in(model, false, cache.path().into()),
+            Some(existing)
+        );
     }
 
     #[test]
@@ -787,7 +890,7 @@ mod tests {
                 &snapshot,
                 cache.path(),
                 Some(revision),
-                ignore_weights,
+                SnapshotRequest::Model { ignore_weights },
             )
             .unwrap()
         };
@@ -812,7 +915,7 @@ mod tests {
         let cache = TempDir::new().unwrap();
         let staging = TempDir::new_in(cache.path()).unwrap();
         let model = "org/model";
-        let files = ["config.json", "tokenizer.json"];
+        let files = ["config.json", "tokenizer.json", "model.safetensors"];
         let destination = build_hf_cache(cache.path(), model, &files);
         let refs = destination
             .parent()
@@ -835,7 +938,7 @@ mod tests {
         fs::write(snapshot.join("nested/model.safetensors"), b"complete").unwrap();
 
         assert!(
-            publish_streamed_hf_snapshot(staging.path(), &snapshot, cache.path(), None, false)
+            publish_streamed_hf_snapshot(staging.path(), &snapshot, cache.path(), None, FULL_MODEL)
                 .is_err()
         );
         assert_eq!(
@@ -854,12 +957,16 @@ mod tests {
         let blob = cache.path().join("blob");
         fs::write(&blob, b"prior blob").unwrap();
         std::os::unix::fs::symlink(&blob, destination.join("config.json")).unwrap();
-        let snapshot = build_hf_cache(staging.path(), model, &["config.json", "model.safetensors"]);
+        let snapshot = build_hf_cache(
+            staging.path(),
+            model,
+            &["config.json", "tokenizer.json", "model.safetensors"],
+        );
         fs::write(snapshot.join("config.json"), b"new config").unwrap();
         fs::write(snapshot.join("model.safetensors"), b"complete").unwrap();
 
         assert_eq!(
-            publish_streamed_hf_snapshot(staging.path(), &snapshot, cache.path(), None, false)
+            publish_streamed_hf_snapshot(staging.path(), &snapshot, cache.path(), None, FULL_MODEL)
                 .unwrap(),
             destination
         );
@@ -890,12 +997,16 @@ mod tests {
         fs::write(sibling.join("config.json"), b"sibling").unwrap();
         std::os::unix::fs::symlink(&sibling, destination.join("nested")).unwrap();
 
-        let snapshot = build_hf_cache(staging.path(), model, &["config.json"]);
+        let snapshot = build_hf_cache(
+            staging.path(),
+            model,
+            &["config.json", "tokenizer.json", "model.safetensors"],
+        );
         fs::create_dir(snapshot.join("nested")).unwrap();
         fs::write(snapshot.join("nested/config.json"), b"streamed").unwrap();
 
         assert!(
-            publish_streamed_hf_snapshot(staging.path(), &snapshot, cache.path(), None, false)
+            publish_streamed_hf_snapshot(staging.path(), &snapshot, cache.path(), None, FULL_MODEL)
                 .is_err()
         );
         assert_eq!(fs::read(sibling.join("config.json")).unwrap(), b"sibling");
@@ -923,6 +1034,26 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn cached_model_tries_other_tokenizers_and_weights_after_io_errors() {
+        let dir = TempDir::new().unwrap();
+        let snapshot = build_hf_cache(
+            dir.path(),
+            "org/model",
+            &["config.json", "pytorch_model.bin"],
+        );
+        for name in ["tokenizer.json", "model.safetensors", "broken.tiktoken"] {
+            std::os::unix::fs::symlink(name, snapshot.join(name)).unwrap();
+        }
+        assert!(has_required_model_files(&snapshot, true).is_err());
+        for alt in ["tiktoken.model", "valid.tiktoken"] {
+            fs::write(snapshot.join(alt), b"tokenizer").unwrap();
+            assert!(has_required_model_files(&snapshot, false).unwrap());
+            fs::remove_file(snapshot.join(alt)).unwrap();
+        }
+    }
+
     #[test]
     fn native_metadata_cache_hit_still_requires_weights_for_full_fetch() {
         let cache = TempDir::new().unwrap();
@@ -933,8 +1064,20 @@ mod tests {
             Some(snapshot.clone())
         );
         assert!(get_cached_model_path_in(model, false, cache.path().into()).is_none());
+        fs::write(snapshot.join("consolidated.safetensors"), b"native weights").unwrap();
+        assert_eq!(
+            get_cached_model_path_in(model, false, cache.path().into()),
+            Some(snapshot.clone())
+        );
+        // Some repositories ship HF configuration alongside their native artifacts.
         fs::write(snapshot.join("config.json"), "{}").unwrap();
-        assert!(get_cached_model_path_in(model, true, cache.path().into()).is_none());
+        assert_eq!(
+            get_cached_model_path_in(model, false, cache.path().into()),
+            Some(snapshot.clone())
+        );
+        fs::remove_file(snapshot.join("params.json")).unwrap();
+        fs::write(snapshot.join("tokenizer.json"), b"{}").unwrap();
+        assert!(get_cached_model_path_in(model, false, cache.path().into()).is_none());
     }
 
     #[test]
