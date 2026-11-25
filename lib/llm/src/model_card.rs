@@ -2124,7 +2124,7 @@ impl ModelDeploymentCard {
         }
 
         // Pre-resolve hf:// repos once per unique repo; otherwise the
-        // resolve loop would call hub::from_hf N times for one model.
+        // resolve loop would fetch the same snapshot for each checked file.
         let mut hf_snapshots: std::collections::HashMap<String, PathBuf> =
             std::collections::HashMap::new();
         for (uri, _) in &entries {
@@ -2132,9 +2132,11 @@ impl ModelDeploymentCard {
                 let (repo, _) = parse_hf_uri(uri)?;
                 if let std::collections::hash_map::Entry::Vacant(e) = hf_snapshots.entry(repo) {
                     let repo_name = e.key().clone();
-                    let snap = crate::hub::from_hf(&repo_name, /* ignore_weights = */ true)
+                    let snap = crate::hub::snapshot_for_checked_metadata(&repo_name)
                         .await
-                        .with_context(|| format!("hub::from_hf({repo_name})"))?;
+                        .with_context(|| {
+                            format!("Failed to resolve Hugging Face metadata for {repo_name}")
+                        })?;
                     e.insert(snap);
                 }
             }
@@ -3485,6 +3487,47 @@ mod tests {
             )?;
         }
         Ok(snapshot)
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn download_config_checks_native_hf_metadata_offline() -> anyhow::Result<()> {
+        let home = tempfile::tempdir()?;
+        let cache = home.path().join("hub");
+        let snapshot = cache.join("models--org--native/snapshots/abc");
+        std::fs::create_dir_all(&snapshot)?;
+        let tekken = snapshot.join("tekken.json");
+        std::fs::write(&tekken, b"{}")?;
+        let mut card = ModelDeploymentCard::with_name_only("org/native");
+        card.tokenizer = Some(super::TokenizerKind::TekkenJson(CheckedFile::from_disk(
+            &tekken,
+        )?));
+        card.move_to_url("hf://org/native/")?;
+
+        temp_env::async_with_vars(
+            [
+                ("HOME", Some(home.path().as_os_str())),
+                ("HF_HUB_CACHE", Some(cache.as_os_str())),
+                ("HF_HUB_OFFLINE", Some("1".as_ref())),
+                ("MODEL_EXPRESS_NO_SHARED_STORAGE", Some("1".as_ref())),
+                ("MODEL_EXPRESS_URL", Some("http://[".as_ref())),
+            ],
+            async {
+                std::fs::write(&tekken, b"[]")?;
+                let error = card.download_config(None).await.unwrap_err();
+                assert!(
+                    format!("{error:#}").contains("checksum mismatch"),
+                    "{error:#}"
+                );
+                std::fs::write(&tekken, b"{}")?;
+                std::fs::write(snapshot.join("params.json"), b"{}")?;
+                card.download_config(None).await?;
+                assert_eq!(std::fs::read(card.local_dir().join("tekken.json"))?, b"{}");
+                assert_eq!(std::fs::read(card.local_dir().join("params.json"))?, b"{}");
+                Ok(())
+            },
+        )
+        .await
     }
 
     #[tokio::test]
