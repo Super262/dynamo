@@ -1226,38 +1226,45 @@ fn publish_mdc_generation(
     }
 }
 
-fn verify_mdc_generation(dir: &Path) -> anyhow::Result<()> {
-    let key = dir
-        .file_name()
-        .and_then(|name| name.to_str())
-        .and_then(|name| name.strip_prefix("v2-"))
-        .with_context(|| {
-            format!(
-                "Legacy MDC generation at {} cannot guarantee sibling integrity; re-resolve the original model card",
-                dir.display()
-            )
-        })?;
-    let digest = key.split_once('-').map_or(key, |(digest, _)| digest);
-    let expected = blake3::Hash::from_hex(digest).context("Invalid MDC generation digest")?;
-    anyhow::ensure!(
-        std::fs::symlink_metadata(dir)
-            .with_context(|| format!("Reading MDC generation directory {}", dir.display()))?
-            .is_dir(),
-        "Invalid MDC generation directory at {}; re-resolve the original model card",
-        dir.display()
-    );
-    let actual = mdc_generation_digest(dir).with_context(|| {
+fn verify_mdc_generation(dir: &Path, files: &[CheckedFile]) -> anyhow::Result<()> {
+    let verify = || -> anyhow::Result<()> {
+        let key = dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix("v2-"))
+            .context("Legacy MDC generation cannot guarantee sibling integrity")?;
+        let digest = key.split_once('-').map_or(key, |(digest, _)| digest);
+        let expected = blake3::Hash::from_hex(digest).context("Invalid MDC generation digest")?;
+        anyhow::ensure!(
+            std::fs::symlink_metadata(dir)?.is_dir(),
+            "Invalid MDC generation directory"
+        );
+        anyhow::ensure!(
+            mdc_generation_digest(dir)? == expected,
+            "Generation digest mismatch"
+        );
+
+        // On Unix the directory digest covers link names and destinations.
+        // Check the declared bytes too, including links to an evicted blob.
+        for file in files {
+            let path = file
+                .path()
+                .context("Expected a resolved metadata file path")?;
+            anyhow::ensure!(
+                path.parent() == Some(dir),
+                "Metadata file {} is outside the selected generation",
+                path.display()
+            );
+            verify_metadata_file(path, file)?;
+        }
+        Ok(())
+    };
+    verify().with_context(|| {
         format!(
             "Damaged MDC generation at {}; re-resolve the original model card",
             dir.display()
         )
-    })?;
-    anyhow::ensure!(
-        actual == expected,
-        "Damaged MDC generation at {}; re-resolve the original model card",
-        dir.display()
-    );
-    Ok(())
+    })
 }
 
 fn cached_metadata_snapshot(
@@ -2587,12 +2594,22 @@ impl ModelDeploymentCard {
         &mut self,
         local_model_path: Option<&Path>,
     ) -> anyhow::Result<()> {
-        let source = self.source_path().to_string();
-        let mdcsum = self.mdcsum().to_string();
-        let blobs = mdc_blobs_dir()?;
         let local_dir = self.local_dir();
-        let generations = mdc_hf_generations(&mdc_local_path(&self.slug, &mdcsum));
+        let generations = mdc_hf_generations(&mdc_local_path(&self.slug, self.mdcsum()));
+        if local_dir.parent() == Some(generations.as_path()) {
+            // Check a pinned local generation as a unit before any missing
+            // slot can independently fall back to another checkout.
+            let files = self
+                .iter_metadata_files()
+                .into_iter()
+                .map(|(file, _)| file.clone())
+                .collect::<Vec<_>>();
+            return tokio::task::spawn_blocking(move || verify_mdc_generation(&local_dir, &files))
+                .await?;
+        }
 
+        let source = self.source_path().to_string();
+        let blobs = mdc_blobs_dir()?;
         let mut entries = Vec::new();
         let mut ngc_snapshot = None;
         for (cf, is_custom) in self.iter_metadata_files() {
@@ -2693,10 +2710,6 @@ impl ModelDeploymentCard {
             .filter_map(|(uri, _)| file_uri_parent(uri))
             .collect();
         let local_dir = tokio::task::spawn_blocking(move || {
-            if !has_hf_checkout && local_dir.parent() == Some(generations.as_path()) {
-                verify_mdc_generation(&local_dir)?;
-                return Ok(local_dir);
-            }
             let staged = if !has_hf_checkout {
                 std::fs::create_dir_all(&local_dir)?;
                 None
@@ -4552,6 +4565,111 @@ mod tests {
                 let cfg = HFConfig::from_json_file(card.local_dir().join("config.json"))?;
                 assert!(cfg.eos_token_ids().contains(&200));
                 assert_eq!(cfg.bos_token_id(), Some(201));
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn resolved_card_rejects_partial_eviction_without_mixing_hf_revisions()
+    -> anyhow::Result<()> {
+        use std::fs;
+
+        let home = tempfile::tempdir()?;
+        let cache = home.path().join("hub");
+        let repo = cache.join("models--org--model");
+        let a = repo.join("snapshots/a");
+        let b = repo.join("snapshots/b");
+        fs::create_dir_all(repo.join("refs"))?;
+        let main = repo.join("refs/main");
+        fs::write(&main, b"a")?;
+        for (snapshot, model_eos, generation_eos) in [(&a, 1, 11), (&b, 2, 22)] {
+            fs::create_dir_all(snapshot)?;
+            fs::write(
+                snapshot.join("config.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "architectures": ["FakeForCausalLM"],
+                    "model_type": "fake",
+                    "eos_token_id": model_eos,
+                }))?,
+            )?;
+            fs::write(
+                snapshot.join("generation_config.json"),
+                serde_json::to_vec(&serde_json::json!({"eos_token_id": generation_eos}))?,
+            )?;
+            fs::write(snapshot.join("tokenizer.json"), b"same tokenizer")?;
+        }
+
+        let tokenizer = CheckedFile::from_disk(a.join("tokenizer.json"))?;
+        let mut card = ModelDeploymentCard::with_name_only("org/model");
+        card.model_info = Some(super::ModelInfoType::HfConfigJson(CheckedFile::from_disk(
+            a.join("config.json"),
+        )?));
+        card.tokenizer = Some(super::TokenizerKind::HfTokenizerJson(tokenizer.clone()));
+        card.move_to_url("hf://org/model/")?;
+
+        temp_env::async_with_vars(
+            [
+                ("HOME", Some(home.path().as_os_str())),
+                ("HF_HUB_CACHE", Some(cache.as_os_str())),
+                ("HF_HUB_OFFLINE", Some("1".as_ref())),
+                ("MODEL_EXPRESS_NO_SHARED_STORAGE", Some("1".as_ref())),
+            ],
+            async {
+                card.download_config(None).await?;
+                let local = card.local_dir();
+                let mut restored = ModelDeploymentCard::load_from_json_str(&card.to_json()?)?;
+                fs::write(&main, b"b")?;
+                restored.download_config(None).await?;
+                assert_eq!(restored.local_dir(), local);
+                assert_eq!(
+                    HFConfig::from_json_file(local.join("config.json"))?.eos_token_ids(),
+                    [11]
+                );
+
+                let published = local.join("tokenizer.json");
+                fs::remove_file(&published)?;
+                let error = match restored.download_config(None).await {
+                    Ok(()) => anyhow::bail!(
+                        "Partially evicted generation resolved with EOS {:?}",
+                        HFConfig::from_json_file(restored.local_dir().join("config.json"))?
+                            .eos_token_ids()
+                    ),
+                    Err(error) => error,
+                };
+                assert!(
+                    error
+                        .to_string()
+                        .contains("re-resolve the original model card")
+                );
+                assert_eq!(restored.local_dir(), local);
+                assert!(!published.exists());
+
+                let blob = super::mdc_blobs_dir()?.join(tokenizer.checksum().hash());
+                super::symlink_force(&blob, &published)?;
+                restored.download_config(None).await?;
+                #[cfg(unix)]
+                {
+                    fs::remove_file(&blob)?;
+                    assert!(fs::symlink_metadata(&published)?.is_symlink());
+                    let error = restored.download_config(None).await.unwrap_err();
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("re-resolve the original model card")
+                    );
+                    assert!(!blob.exists());
+
+                    fs::write(&blob, b"bad tokenizer!")?;
+                    let error = restored.download_config(None).await.unwrap_err();
+                    assert!(format!("{error:#}").contains("checksum mismatch"));
+                    assert_eq!(fs::read(blob)?, b"bad tokenizer!");
+                }
+                assert_eq!(restored.local_dir(), local);
+                assert_eq!(fs::read_dir(local.parent().unwrap())?.count(), 1);
+                assert_eq!(fs::read(main)?, b"b");
                 Ok(())
             },
         )

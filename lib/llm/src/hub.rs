@@ -182,9 +182,34 @@ fn has_model_weights(
     any_available(weights.chain(indexes))
 }
 
-// Direct downloads resolve and fetch the repository's advertised artifacts.
-// The backend may use tokenizer files that Dynamo itself does not recognize.
-fn has_direct_model_files(snapshot: &Path, files: &[String]) -> io::Result<bool> {
+// A finished stream validates delivered bytes, but has no upstream artifact
+// inventory. Require evidence of a complete tokenizer layout for the backend.
+fn has_backend_tokenizer_files(snapshot: &Path) -> io::Result<bool> {
+    let has = |name| match fs::metadata(snapshot.join(name)) {
+        Ok(meta) => Ok(meta.is_file() && meta.len() > 0),
+        Err(error) if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    };
+    let single_files = [
+        "tokenizer.model",
+        "spiece.model",
+        "sentencepiece.bpe.model",
+        "vocab.txt",
+    ];
+    any_available(
+        single_files
+            .into_iter()
+            .map(has)
+            .chain(std::iter::once_with(|| {
+                Ok(has("vocab.json")? && has("merges.txt")?)
+            })),
+    )
+}
+
+// Some model backends consume tokenizer files that Dynamo does not recognize.
+fn has_backend_model_files(snapshot: &Path, files: &[String]) -> io::Result<bool> {
     match cached_file_type(&snapshot.join("config.json"))? {
         Some(kind) if kind.is_file() => {}
         Some(_) => return Ok(false),
@@ -204,7 +229,7 @@ fn has_direct_model_files(snapshot: &Path, files: &[String]) -> io::Result<bool>
     Ok(true)
 }
 
-fn direct_model_artifacts(snapshot: &Path) -> io::Result<Vec<String>> {
+fn backend_model_artifacts(snapshot: &Path) -> io::Result<Vec<String>> {
     let mut files = Vec::new();
     for entry in fs::read_dir(snapshot)? {
         let entry = entry?;
@@ -239,7 +264,7 @@ fn cached_hf_model_files(
         else {
             return Ok(false);
         };
-        Ok(has_direct_model_files(snapshot, sidecars)?)
+        Ok(has_backend_model_files(snapshot, sidecars)?)
     })();
     if matches!(&delegated, Ok(true)) {
         return Ok(true);
@@ -359,6 +384,24 @@ enum SnapshotRequest {
 }
 
 impl SnapshotRequest {
+    fn verify_metadata(&self, snapshot: &Path) -> anyhow::Result<()> {
+        if let Self::CheckedMetadata { files, blobs } = self {
+            crate::model_card::matching_metadata_files(snapshot, files, Some(blobs)).map_err(
+                |error| {
+                    if error
+                        .downcast_ref::<io::Error>()
+                        .is_some_and(|e| e.kind() != ErrorKind::NotFound)
+                    {
+                        error.context(CacheInspectionFailed)
+                    } else {
+                        error
+                    }
+                },
+            )?;
+        }
+        Ok(())
+    }
+
     fn ignore_weights(&self) -> bool {
         match self {
             Self::Model { ignore_weights } => *ignore_weights,
@@ -540,7 +583,7 @@ async fn mx_download_from_server(
     let mut first_error = None;
     for root in hf_cache_roots() {
         let result = match hf.get_model_path(model_name, root).await {
-            Ok(path) => local_hf_snapshot(path).await,
+            Ok(path) => local_hf_snapshot(path, request.clone()).await,
             Err(error) => Err(error),
         };
         match result {
@@ -582,9 +625,11 @@ fn shared_hf_revision(
                         *ignore_weights || !metadata_only_revisions(&root, &repo)?.contains(rev);
                     Ok(eligible.then_some(false))
                 }
-                SnapshotRequest::CheckedMetadata { files, blobs } => Ok(Some(
-                    crate::model_card::matching_metadata_files(&path, files, Some(blobs)).is_ok(),
-                )),
+                SnapshotRequest::CheckedMetadata { .. } => match request.verify_metadata(&path) {
+                    Ok(()) => Ok(Some(true)),
+                    Err(error) if error.is::<CacheInspectionFailed>() => Err(error),
+                    Err(_) => Ok(None),
+                },
             }
         })?;
         match candidate {
@@ -613,17 +658,16 @@ pub(super) fn hf_snapshot_repo(path: &Path) -> anyhow::Result<&Path> {
         .with_context(|| format!("Invalid HF snapshot directory: {}", path.display()))
 }
 
-async fn local_hf_snapshot(path: PathBuf) -> anyhow::Result<PathBuf> {
+async fn local_hf_snapshot(path: PathBuf, request: SnapshotRequest) -> anyhow::Result<PathBuf> {
     tokio::task::spawn_blocking(move || {
-        let exists = read_hf_checkout(hf_snapshot_repo(&path)?, || {
-            Ok(cached_file_type(&path)?.is_some_and(|kind| kind.is_dir()))
+        let verified = read_hf_checkout(hf_snapshot_repo(&path)?, || {
+            Ok(cached_file_type(&path)?
+                .filter(|kind| kind.is_dir())
+                .map(|_| request.verify_metadata(&path)))
         })
         .context(CacheInspectionFailed)?;
-        anyhow::ensure!(
-            exists,
-            "Missing Hugging Face snapshot at {}",
-            path.display()
-        );
+        verified
+            .with_context(|| format!("Missing Hugging Face snapshot at {}", path.display()))??;
         Ok(path)
     })
     .await?
@@ -775,6 +819,7 @@ struct HfRequestOrder {
     main: Option<PublishedMain>,
     #[serde(default)]
     metadata_only: Option<std::collections::BTreeSet<String>>,
+    // The existing serialized field also records full backend-tokenized streams.
     #[serde(default)]
     direct_models: std::collections::BTreeMap<String, Vec<String>>,
 }
@@ -790,6 +835,7 @@ struct PublishedMain {
 enum PublishedSnapshotKind {
     Metadata,
     Full,
+    // Kept as DirectFull on disk for both direct and streamed backend layouts.
     DirectFull,
     ProviderDefinedFull,
 }
@@ -808,7 +854,7 @@ impl PublishedMain {
         ignore_weights: bool,
         main_ref: &Path,
         snapshots: &Path,
-        direct_sidecars: Option<&[String]>,
+        backend_artifacts: Option<&[String]>,
     ) -> io::Result<bool> {
         let full = !matches!(self.kind, PublishedSnapshotKind::Metadata);
         // Prefer a complete checkout, then the later request within that class.
@@ -826,9 +872,9 @@ impl PublishedMain {
             PublishedSnapshotKind::Full => has_required_model_files(&path, false),
             PublishedSnapshotKind::DirectFull => any_available(
                 std::iter::once_with(|| has_required_model_files(&path, false)).chain(
-                    direct_sidecars
+                    backend_artifacts
                         .into_iter()
-                        .map(|sidecars| has_direct_model_files(&path, sidecars)),
+                        .map(|sidecars| has_backend_model_files(&path, sidecars)),
                 ),
             ),
             _ => match fs::metadata(&path) {
@@ -908,25 +954,27 @@ fn publish_hf_snapshot(
         );
     }
 
-    let mut direct_sidecars = None;
+    let mut backend_artifacts = None;
     match &request {
         SnapshotRequest::Model { .. }
             if matches!(validation, HfModelValidation::SharedProvider) => {}
         SnapshotRequest::Model { ignore_weights } => {
-            let complete = has_required_model_files(snapshot, *ignore_weights);
-            let delegated = !ignore_weights && matches!(validation, HfModelValidation::Direct);
-            let complete = if delegated && !matches!(&complete, Ok(true)) {
-                let sidecars = direct_model_artifacts(snapshot)?;
-                let matches = has_direct_model_files(snapshot, &sidecars)?;
-                if matches {
-                    direct_sidecars = Some(sidecars);
-                }
-                matches
-            } else {
-                complete.with_context(|| {
-                    format!("Failed to inspect staged snapshot {}", snapshot.display())
-                })?
-            };
+            let complete = any_available(
+                std::iter::once_with(|| has_required_model_files(snapshot, *ignore_weights)).chain(
+                    std::iter::once_with(|| {
+                        if *ignore_weights
+                            || (matches!(validation, HfModelValidation::Stream)
+                                && !has_backend_tokenizer_files(snapshot)?)
+                            || !has_backend_model_files(snapshot, &[])?
+                        {
+                            return Ok(false);
+                        }
+                        backend_artifacts = Some(backend_model_artifacts(snapshot)?);
+                        Ok(true)
+                    }),
+                ),
+            )
+            .with_context(|| format!("Failed to inspect staged snapshot {}", snapshot.display()))?;
             anyhow::ensure!(
                 complete,
                 "Staged Hugging Face snapshot at {} is incomplete",
@@ -1050,9 +1098,9 @@ fn publish_hf_snapshot(
                 .is_err_and(|error| error.kind() == ErrorKind::NotFound)
         });
         direct_changed = order.direct_models.len() != before;
-        match (validation, direct_sidecars) {
-            (HfModelValidation::Direct, Some(sidecars)) => {
-                order.direct_models.insert(revision.to_owned(), sidecars);
+        match (validation, backend_artifacts) {
+            (_, Some(artifacts)) => {
+                order.direct_models.insert(revision.to_owned(), artifacts);
                 direct_changed = true;
                 PublishedSnapshotKind::DirectFull
             }
@@ -1205,6 +1253,12 @@ fn install_snapshot_merge(
         } else {
             target.strip_prefix(repo)?
         };
+        if existed
+            && relative.starts_with("snapshots")
+            && fs::symlink_metadata(target)?.is_symlink()
+        {
+            pin_snapshot_blob(repo, target, &prepared.join(format!("{i}.old")))?;
+        }
         entries.push((relative.to_owned(), existed));
         fs::rename(source, prepared.join(i.to_string()))?;
     }
@@ -1216,7 +1270,7 @@ fn install_snapshot_merge(
                 let old = journal.join(format!("{i}.old"));
                 // Keep the name readable across replacement when hard links are
                 // supported. Renaming also works on protected multi-user caches.
-                if fs::hard_link(target, &old).is_err() {
+                if !entry_exists(&old)? && fs::hard_link(target, &old).is_err() {
                     fs::rename(target, old)?;
                 }
             }
@@ -1230,6 +1284,60 @@ fn install_snapshot_merge(
             .with_context(|| format!("Recovering HF checkout after publication failed: {error}"))?;
         return Err(error).context("Publishing HF snapshot files");
     }
+    Ok(())
+}
+
+// Native HF checkouts link to blobs that ModelExpress can collect as soon as
+// the live link is replaced. Pin the old bytes before exposing the journal so
+// rollback can restore a self-contained checkout even if the blob name is gone.
+fn pin_snapshot_blob(repo: &Path, target: &Path, saved: &Path) -> anyhow::Result<()> {
+    let blobs = repo.join("blobs");
+    match fs::symlink_metadata(&blobs) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => return Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    }
+    let blob = match fs::canonicalize(target) {
+        Ok(blob) => blob,
+        Err(error) if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if blob.parent() != Some(repo.canonicalize()?.join("blobs").as_path())
+        || !fs::symlink_metadata(&blob)?.is_file()
+    {
+        return Ok(());
+    }
+    if fs::hard_link(&blob, saved).is_ok() {
+        anyhow::ensure!(
+            fs::symlink_metadata(saved)?.is_file(),
+            "HF blob changed while preparing rollback"
+        );
+        return Ok(());
+    }
+    // Shared caches can prohibit hard links to another user's files.
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let mut source = options.open(&blob)?;
+    let metadata = source.metadata()?;
+    anyhow::ensure!(
+        metadata.is_file(),
+        "HF blob changed while preparing rollback"
+    );
+    let mut backup = fs::File::create_new(saved)?;
+    let written = io::copy(&mut source, &mut backup)?;
+    anyhow::ensure!(
+        written == metadata.len(),
+        "HF blob changed while preparing rollback"
+    );
+    backup.set_permissions(metadata.permissions())?;
     Ok(())
 }
 
@@ -1261,14 +1369,15 @@ fn merge_ref_revision(path: &Path) -> anyhow::Result<Option<String>> {
         "Invalid HF ref at {}",
         path.display()
     );
-    let value = fs::read_to_string(path)?;
+    let value = fs::read(path)?;
+    let Ok(value) = std::str::from_utf8(&value) else {
+        return Ok(None);
+    };
     let revision = value.trim();
-    anyhow::ensure!(
-        Path::new(revision).file_name() == Some(OsStr::new(revision)),
-        "Invalid HF revision in {}",
-        path.display(),
-    );
-    Ok(Some(revision.to_owned()))
+    Ok(
+        (!revision.contains('\0') && Path::new(revision).file_name() == Some(OsStr::new(revision)))
+            .then(|| revision.to_owned()),
+    )
 }
 
 fn rollback_snapshot_merge(repo: &Path, journal: &Path, retired: &Path) -> anyhow::Result<()> {
@@ -1282,6 +1391,7 @@ fn rollback_snapshot_merge(repo: &Path, journal: &Path, retired: &Path) -> anyho
     let mut revisions = std::collections::BTreeSet::new();
     let mut new_snapshots = std::collections::BTreeSet::new();
     let mut backup_refs = std::collections::BTreeMap::new();
+    let mut invalid_refs = std::collections::BTreeSet::new();
     let mut replay = Vec::with_capacity(entries.len());
     for (i, (relative, existed)) in entries.iter().enumerate() {
         let components: Vec<_> = relative.components().collect();
@@ -1312,9 +1422,14 @@ fn rollback_snapshot_merge(repo: &Path, journal: &Path, retired: &Path) -> anyho
             {
                 continue;
             }
-            if *existed && let Some(rev) = merge_ref_revision(&journal.join(format!("{i}.old")))? {
-                revisions.insert(std::ffi::OsString::from(&rev));
-                backup_refs.insert(i, rev);
+            let old = journal.join(format!("{i}.old"));
+            if *existed && entry_exists(&old)? {
+                if let Some(rev) = merge_ref_revision(&old)? {
+                    revisions.insert(std::ffi::OsString::from(&rev));
+                    backup_refs.insert(i, rev);
+                } else {
+                    invalid_refs.insert(i);
+                }
             }
         }
         replay.push((i, relative, existed));
@@ -1336,7 +1451,12 @@ fn rollback_snapshot_merge(repo: &Path, journal: &Path, retired: &Path) -> anyho
         let rev = OsStr::new(rev);
         missing.contains(rev) || new_snapshots.contains(rev)
     };
-    let repair_order = !missing.is_empty() || backup_refs.values().any(|rev| ref_unavailable(rev));
+    let repair_eviction =
+        !missing.is_empty() || backup_refs.values().any(|rev| ref_unavailable(rev));
+    let invalid_main = invalid_refs
+        .iter()
+        .any(|&i| entries[i].0 == Path::new("refs/main"));
+    let repair_order = invalid_main || repair_eviction;
     let mut keep_main = None;
     let mut staged_order = None;
     for (i, relative, existed) in replay.into_iter().rev() {
@@ -1370,21 +1490,24 @@ fn rollback_snapshot_merge(repo: &Path, journal: &Path, retired: &Path) -> anyho
             }
             staged_order = Some(new.clone());
         }
-        if repair_order
-            && relative.starts_with("refs")
-            && backup_refs.get(&i).is_none_or(|rev| ref_unavailable(rev))
+        if relative.starts_with("refs")
+            && (invalid_refs.contains(&i)
+                || (repair_eviction && backup_refs.get(&i).is_none_or(|rev| ref_unavailable(rev))))
         {
             if let Some(current) = merge_ref_revision(&target)? {
                 if !ref_unavailable(&current) && cache_directory_exists(&snapshots.join(&current))?
                 {
                     if relative == Path::new("refs/main")
-                        && backup_refs.get(&i).is_some_and(|rev| ref_unavailable(rev))
+                        && (invalid_refs.contains(&i)
+                            || backup_refs.get(&i).is_some_and(|rev| ref_unavailable(rev)))
                     {
                         keep_main = Some(current);
                     }
                 } else {
                     fs::remove_file(&target)?;
                 }
+            } else if entry_exists(&target)? {
+                fs::remove_file(&target)?;
             }
             continue;
         }
@@ -1392,6 +1515,16 @@ fn rollback_snapshot_merge(repo: &Path, journal: &Path, retired: &Path) -> anyho
             // A failed install can leave the unchanged target and its hard-link
             // backup in place, including when the target directory is read-only.
             if entry_exists(&old)? && (!entry_exists(&new)? || !entry_exists(&target)?) {
+                if relative.starts_with("snapshots") && fs::symlink_metadata(&old)?.is_symlink() {
+                    // Older journals saved the link relative to the original checkout.
+                    let blob = target.with_file_name(fs::read_link(&old)?);
+                    let private = tempfile::tempdir_in(journal)?;
+                    let pin = private.path().join("blob");
+                    pin_snapshot_blob(repo, &blob, &pin)?;
+                    if entry_exists(&pin)? {
+                        fs::rename(pin, &old)?;
+                    }
+                }
                 fs::rename(old, &target)?;
             }
         } else if !entry_exists(&new)? {
@@ -1403,10 +1536,10 @@ fn rollback_snapshot_merge(repo: &Path, journal: &Path, retired: &Path) -> anyho
         let mut order = HfRequestOrder::read(&state)?;
         // Preserve issued tickets and provenance for surviving revisions.
         if evicted
-            || order
-                .main
-                .as_ref()
-                .is_some_and(|main| ref_unavailable(&main.revision))
+            || order.main.as_ref().is_some_and(|main| {
+                ref_unavailable(&main.revision)
+                    || (invalid_main && keep_main.as_ref() != Some(&main.revision))
+            })
         {
             order.main = None;
         }
@@ -1603,7 +1736,7 @@ async fn mx_download_direct(
     }
     let path = mx::download_model(model_name, provider, Some(cache), ignore_weights).await?;
     if is_hf {
-        return local_hf_snapshot(path).await;
+        return local_hf_snapshot(path, request).await;
     }
     Ok(path)
 }
@@ -2071,6 +2204,143 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    mod mx_fixture {
+        use modelexpress_common::grpc::model::{
+            DeleteModelRequest, DeleteModelResponse, FileChunk, ModelDownloadRequest,
+            ModelFileList, ModelFilesRequest, ModelStatus, ModelStatusUpdate,
+            model_service_server::{ModelService, ModelServiceServer},
+        };
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tonic::{Request, Response, Status};
+
+        struct ModelFixture {
+            revision: String,
+            streams: HashMap<String, Vec<FileChunk>>,
+            ensure_calls: Arc<AtomicUsize>,
+            stream_calls: Arc<AtomicUsize>,
+        }
+
+        #[tonic::async_trait]
+        impl ModelService for ModelFixture {
+            type EnsureModelDownloadedStream =
+                tokio_stream::Iter<std::array::IntoIter<Result<ModelStatusUpdate, Status>, 1>>;
+            type StreamModelFilesStream =
+                tokio_stream::Iter<std::vec::IntoIter<Result<FileChunk, Status>>>;
+
+            async fn ensure_model_downloaded(
+                &self,
+                request: Request<ModelDownloadRequest>,
+            ) -> Result<Response<Self::EnsureModelDownloadedStream>, Status> {
+                self.ensure_calls.fetch_add(1, Ordering::Relaxed);
+                let request = request.into_inner();
+                let update = ModelStatusUpdate {
+                    model_name: request.model_name,
+                    provider: request.provider,
+                    status: ModelStatus::Downloaded as i32,
+                    resolved_revision: Some(self.revision.clone()),
+                    ..Default::default()
+                };
+                Ok(Response::new(tokio_stream::iter([Ok(update)])))
+            }
+
+            async fn stream_model_files(
+                &self,
+                request: Request<ModelFilesRequest>,
+            ) -> Result<Response<Self::StreamModelFilesStream>, Status> {
+                self.stream_calls.fetch_add(1, Ordering::Relaxed);
+                let request = request.into_inner();
+                if request.revision.as_deref() != Some(self.revision.as_str()) {
+                    return Err(Status::invalid_argument("Unexpected fixture revision"));
+                }
+                let payload = self
+                    .streams
+                    .get(&request.model_name)
+                    .ok_or_else(|| Status::not_found("No fixture stream for this model"))?
+                    .iter()
+                    .cloned()
+                    .map(Ok)
+                    .collect::<Vec<_>>();
+                Ok(Response::new(tokio_stream::iter(payload)))
+            }
+
+            async fn list_model_files(
+                &self,
+                _request: Request<ModelFilesRequest>,
+            ) -> Result<Response<ModelFileList>, Status> {
+                Err(Status::unimplemented(
+                    "Fixture does not serve a file inventory",
+                ))
+            }
+
+            async fn delete_model(
+                &self,
+                _request: Request<DeleteModelRequest>,
+            ) -> Result<Response<DeleteModelResponse>, Status> {
+                Err(Status::unimplemented("Fixture does not delete models"))
+            }
+        }
+
+        pub(super) struct MxTestServer {
+            pub(super) endpoint: String,
+            pub(super) ensure_calls: Arc<AtomicUsize>,
+            pub(super) stream_calls: Arc<AtomicUsize>,
+            task: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+        }
+
+        impl Drop for MxTestServer {
+            fn drop(&mut self) {
+                self.task.abort();
+            }
+        }
+
+        pub(super) async fn serve_mx_test_server(
+            revision: &str,
+            streams: HashMap<String, Vec<FileChunk>>,
+        ) -> anyhow::Result<MxTestServer> {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let endpoint = format!("http://{}", listener.local_addr()?);
+            let ensure_calls = Arc::new(AtomicUsize::new(0));
+            let stream_calls = Arc::new(AtomicUsize::new(0));
+            let service = ModelServiceServer::new(ModelFixture {
+                revision: revision.to_owned(),
+                streams,
+                ensure_calls: ensure_calls.clone(),
+                stream_calls: stream_calls.clone(),
+            });
+            let task = tokio::spawn(
+                tonic::transport::Server::builder()
+                    .add_service(service)
+                    .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+            );
+            Ok(MxTestServer {
+                endpoint,
+                ensure_calls,
+                stream_calls,
+                task,
+            })
+        }
+
+        pub(super) fn model_file_chunks(revision: &str, files: &[(&str, &[u8])]) -> Vec<FileChunk> {
+            files
+                .iter()
+                .enumerate()
+                .map(|(i, (name, bytes))| FileChunk {
+                    relative_path: (*name).to_owned(),
+                    data: bytes.to_vec(),
+                    total_size: bytes.len() as u64,
+                    is_last_chunk: true,
+                    is_last_file: i + 1 == files.len(),
+                    commit_hash: (i == 0).then(|| revision.to_owned()),
+                    ..Default::default()
+                })
+                .collect()
+        }
+    }
+
+    use mx_fixture::{model_file_chunks, serve_mx_test_server};
 
     fn publish_streamed_hf_snapshot(
         staging: &Path,
@@ -2556,6 +2826,105 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn rollback_restores_old_blob_bytes_after_eviction() -> anyhow::Result<()> {
+        let root = TempDir::new()?;
+        let repo = root.path().join("models--org--model");
+        let snapshot = repo.join("snapshots/B");
+        let blobs = repo.join("blobs");
+        fs::create_dir_all(&snapshot)?;
+        fs::create_dir(&blobs)?;
+        let blob = blobs.join("old");
+        fs::write(&blob, b"original tokenizer")?;
+        let tokenizer = snapshot.join("tokenizer.json");
+        std::os::unix::fs::symlink("../../blobs/old", &tokenizer)?;
+        let other = snapshot.join("config.json");
+        fs::write(&other, b"old config")?;
+        let stage = TempDir::new_in(root.path())?;
+        let replacement = stage.path().join("tokenizer");
+        fs::write(&replacement, b"replacement")?;
+        let invalid = stage.path().join("invalid");
+        fs::create_dir(&invalid)?; // The second rename triggers rollback of the first.
+        let journal = root.path().join("transaction");
+        let moves = [(replacement, tokenizer.clone()), (invalid, other)];
+        assert!(install_snapshot_merge(stage.path(), &repo, &journal, &moves).is_err());
+        // Eviction can scan while the replacement is visible and unlink its
+        // list of unreferenced blobs even after Dynamo finishes rolling back.
+        fs::remove_file(blob)?;
+        assert_eq!(fs::read(&tokenizer)?, b"original tokenizer");
+
+        // A journal written by an older publisher still contains a relative link.
+        let legacy = blobs.join("legacy");
+        fs::write(&legacy, b"legacy tokenizer")?;
+        fs::create_dir(&journal)?;
+        fs::write(
+            journal.join("manifest"),
+            serde_json::to_vec(&[(tokenizer.strip_prefix(&repo)?, true)])?,
+        )?;
+        std::os::unix::fs::symlink("../../blobs/legacy", journal.join("0.old"))?;
+        rollback_snapshot_merge(&repo, &journal, &root.path().join("retired"))?;
+        fs::remove_file(legacy)?;
+        assert_eq!(fs::read(tokenizer)?, b"legacy tokenizer");
+        Ok(())
+    }
+
+    #[test]
+    fn readable_invalid_ref_backup_does_not_block_recovery() -> anyhow::Result<()> {
+        for bad in [b"".as_slice(), b" \n", b"../other", b"\xff", b"bad\0name"] {
+            let root = TempDir::new()?;
+            let model = "org/model";
+            let snapshot = build_hf_cache(
+                root.path(),
+                model,
+                &["config.json", "tokenizer.json", "model.safetensors"],
+            );
+            let repo = snapshot.parent().unwrap().parent().unwrap();
+            let name = repo.file_name().unwrap();
+            let writer = lock_hf_publication(root.path(), name)?;
+            let journal =
+                hf_publication_lock_path(&root.path().join(".locks"), name).with_extension("merge");
+            fs::create_dir(&journal)?;
+            let config = snapshot.join("config.json");
+            fs::write(
+                journal.join("manifest"),
+                serde_json::to_vec(&[
+                    (config.strip_prefix(repo)?, true),
+                    (Path::new("refs/main"), true),
+                    (Path::new(HF_ORDER_FILE), true),
+                ])?,
+            )?;
+            fs::write(journal.join("0.old"), b"previous config")?;
+            fs::write(journal.join("1.old"), bad)?;
+            let rev = snapshot.file_name().unwrap().to_str().unwrap();
+            let order = |revision: &str, ticket| {
+                serde_json::to_vec(&HfRequestOrder {
+                    issued: 4,
+                    main: Some(PublishedMain {
+                        revision: revision.into(),
+                        ticket,
+                        kind: PublishedSnapshotKind::Full,
+                    }),
+                    ..Default::default()
+                })
+            };
+            fs::write(journal.join("2.old"), order("unrelated", 1)?)?;
+            let state = journal.with_extension("order");
+            fs::write(&state, order(rev, 4)?)?;
+            drop(writer);
+            assert_eq!(
+                get_cached_model_path_in(model, false, root.path().into())?,
+                Some(snapshot.clone())
+            );
+            assert_eq!(fs::read(config)?, b"previous config");
+            assert_eq!(fs::read(repo.join("refs/main"))?, rev.as_bytes());
+            let current = HfRequestOrder::read(&state)?.main.unwrap();
+            assert_eq!((current.revision.as_str(), current.ticket), (rev, 4));
+            assert!(!journal.exists());
+        }
+        Ok(())
+    }
+
     #[test]
     fn failed_main_ref_restores_pinned_ref_and_snapshot() -> anyhow::Result<()> {
         for existing in [false, true] {
@@ -2935,6 +3304,83 @@ mod tests {
                     "{error:#}"
                 );
                 assert!(lock.is_dir());
+                anyhow::Ok(())
+            },
+        )
+        .await
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn stale_shared_metadata_allows_direct_fallback() -> anyhow::Result<()> {
+        let root = TempDir::new()?;
+        let home = root.path().join("home");
+        let cache = root.path().join("hf");
+        let model = "org/shared-metadata";
+        let expected = root.path().join("tokenizer.json");
+        fs::write(&expected, b"current")?;
+        let files: Arc<[_]> = [(
+            "tokenizer.json".to_owned(),
+            CheckedFile::from_disk(expected)?,
+        )]
+        .into();
+        let blobs = root.path().join("blobs");
+        let revision = "0000000000000000000000000000000000000000";
+        let server = serve_mx_test_server(revision, Default::default()).await?;
+        let mut hub = mockito::Server::new_async().await;
+        let endpoint = hub.url();
+        let info = serde_json::json!({"id": model, "sha": revision, "siblings": [{"rfilename": "tokenizer.json"}]});
+        let lookup = hub
+            .mock("GET", format!("/api/models/{model}/revision/main").as_str())
+            .with_body(info.to_string())
+            .create_async()
+            .await;
+        let tokenizer = hub
+            .mock(
+                "GET",
+                format!("/{model}/resolve/{revision}/tokenizer.json").as_str(),
+            )
+            .with_header("x-repo-commit", revision)
+            .with_header("etag", "currenttokenizer")
+            .with_body("current")
+            .expect_at_least(1)
+            .create_async()
+            .await;
+        temp_env::async_with_vars(
+            [
+                ("HOME", Some(home.as_os_str())),
+                ("HF_HUB_CACHE", Some(cache.as_os_str())),
+                ("HF_HUB_OFFLINE", None),
+                ("HF_ENDPOINT", Some(endpoint.as_ref())),
+                ("MODEL_EXPRESS_URL", Some(server.endpoint.as_ref())),
+                ("MODEL_EXPRESS_NO_SHARED_STORAGE", None),
+            ],
+            async {
+                let mx = MxClientConfig::default().cache.local_path;
+                assert!(mx.starts_with(&home));
+                let stale = build_hf_cache(&mx, model, &["tokenizer.json"]);
+                let fetch = || snapshot_for_checked_metadata(model, files.clone(), blobs.clone());
+                let fixed = fetch().await?;
+                assert!(fixed.starts_with(&cache));
+                assert_eq!(fs::read(fixed.join("tokenizer.json"))?, b"current");
+                assert_eq!(fs::read(stale.join("tokenizer.json"))?, b"{}");
+                assert_eq!(fetch().await?, fixed);
+                assert_eq!(
+                    server
+                        .ensure_calls
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    2
+                );
+                assert_eq!(
+                    server
+                        .stream_calls
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    0
+                );
+                let legacy_request = SnapshotRequest::CheckedMetadata { files, blobs };
+                assert!(local_hf_snapshot(stale, legacy_request).await.is_err());
+                lookup.assert_async().await;
+                tokenizer.assert_async().await;
                 anyhow::Ok(())
             },
         )
@@ -3517,6 +3963,119 @@ mod tests {
         .await
     }
 
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn streamed_backend_tokenizer_is_cached_only_with_complete_artifacts()
+    -> anyhow::Result<()> {
+        use std::sync::atomic::Ordering;
+
+        let home = TempDir::new()?;
+        let cache = home.path().join("hub");
+        let model = "org/backend-tokenized";
+        let revision = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let metadata: &[(&str, &[u8])] = &[
+            ("config.json", b"{}"),
+            ("vocab.json", b"{\"a\":0}"),
+            ("merges.txt", b"#version: 0.2\n"),
+        ];
+        let mut complete = metadata.to_vec();
+        complete.push(("model.safetensors", b"complete weights"));
+        let mut no_merges = complete.clone();
+        no_merges.remove(2);
+        let mut missing_shard = metadata.to_vec();
+        missing_shard.extend_from_slice(&[
+            ("model.safetensors.index.json",
+                br#"{"weight_map":{"one":"model-00001.safetensors","two":"model-00002.safetensors"}}"#),
+            ("model-00001.safetensors", b"first shard"),
+        ]);
+        let mut truncated = model_file_chunks(revision, &complete);
+        truncated.last_mut().unwrap().total_size += 1;
+        let streams = std::collections::HashMap::from([
+            (model.to_owned(), model_file_chunks(revision, &complete)),
+            (
+                "org/no-merges".to_owned(),
+                model_file_chunks(revision, &no_merges),
+            ),
+            (
+                "org/no-weights".to_owned(),
+                model_file_chunks(revision, metadata),
+            ),
+            (
+                "org/missing-shard".to_owned(),
+                model_file_chunks(revision, &missing_shard),
+            ),
+            ("org/truncated-stream".to_owned(), truncated),
+        ]);
+        let server = serve_mx_test_server(revision, streams).await?;
+        let endpoint = server.endpoint.clone();
+        temp_env::async_with_vars(
+            [
+                ("HOME", Some(home.path().as_os_str())),
+                ("HF_HUB_CACHE", Some(cache.as_os_str())),
+                ("HF_HUB_OFFLINE", Some("1".as_ref())),
+                ("MODEL_EXPRESS_NO_SHARED_STORAGE", Some("1".as_ref())),
+                ("MODEL_EXPRESS_URL", Some(endpoint.as_ref())),
+            ],
+            async {
+                let snapshot = from_hf(model, false).await?;
+                assert!(!snapshot.join("tokenizer.json").exists());
+                assert_eq!(
+                    fs::read(snapshot.join("model.safetensors"))?,
+                    b"complete weights"
+                );
+                assert_eq!(fs::read(snapshot.join("merges.txt"))?, metadata[2].1);
+                for invalid in [
+                    "org/no-merges",
+                    "org/no-weights",
+                    "org/missing-shard",
+                    "org/truncated-stream",
+                ] {
+                    let error = from_hf(invalid, false).await.unwrap_err();
+                    assert!(format!("{error:#}").contains("incomplete"), "{error:#}");
+                    assert!(
+                        !cache
+                            .join(hf_hub::Repo::model(invalid.to_owned()).folder_name())
+                            .exists()
+                    );
+                }
+                assert_eq!(server.ensure_calls.load(Ordering::Relaxed), 5);
+                assert_eq!(server.stream_calls.load(Ordering::Relaxed), 5);
+
+                drop(server);
+                assert_eq!(from_hf(model, false).await?, snapshot);
+                fs::remove_file(snapshot.join("merges.txt"))?;
+                assert!(from_hf(model, false).await.is_err());
+                anyhow::Ok(())
+            },
+        )
+        .await
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn streamed_backend_tokenizer_preserves_file_inspection_errors() -> anyhow::Result<()> {
+        let cache = TempDir::new()?;
+        let stage = TempDir::new_in(cache.path())?;
+        let model = "org/backend-model";
+        let snapshot = build_hf_cache(
+            stage.path(),
+            model,
+            &["config.json", "merges.txt", "model.safetensors"],
+        );
+        std::os::unix::fs::symlink("vocab.json", snapshot.join("vocab.json"))?;
+        let error =
+            publish_streamed_hf_snapshot(stage.path(), &snapshot, cache.path(), None, FULL_MODEL)
+                .unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<io::Error>()
+                .and_then(io::Error::raw_os_error),
+            Some(libc::ELOOP)
+        );
+        assert!(!cache.path().join("models--org--backend-model").exists());
+        Ok(())
+    }
+
     #[test]
     fn direct_native_consolidated_checkout_allows_backend_tokenizer() -> anyhow::Result<()> {
         let cache = TempDir::new()?;
@@ -3525,7 +4084,11 @@ mod tests {
         let staged = build_hf_cache(
             stage.path(),
             model,
-            &["params.json", "tokenizer.model", "consolidated.safetensors"],
+            &[
+                "params.json",
+                "backend-tokenizer.assets",
+                "consolidated.safetensors",
+            ],
         );
         assert!(
             publish_streamed_hf_snapshot(stage.path(), &staged, cache.path(), None, FULL_MODEL)
@@ -3612,21 +4175,6 @@ mod tests {
                 assert!(format!("{error:#}").contains("is incomplete"));
                 assert!(!cache.join("models--org--delegated-no-weights").exists());
 
-                let stage = TempDir::new_in(&cache)?;
-                let streamed = build_hf_cache(
-                    stage.path(),
-                    model,
-                    &[
-                        "config.json",
-                        "vocab.json",
-                        "merges.txt",
-                        "model.safetensors",
-                    ],
-                );
-                assert!(
-                    publish_streamed_hf_snapshot(stage.path(), &streamed, &cache, None, FULL_MODEL)
-                        .is_err()
-                );
                 anyhow::Ok(snapshot)
             },
         )
