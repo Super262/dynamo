@@ -3019,6 +3019,7 @@ dependencies = [
  "rmp-serde",
  "rstest 0.18.2",
  "rustls",
+ "same-file",
  "serde",
  "serde_json",
  "serial_test",

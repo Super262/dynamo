@@ -36,13 +36,18 @@ fn get_cached_model_path(
     model_name: &str,
     provider: MxModelProvider,
     ignore_weights: bool,
-) -> Option<PathBuf> {
+) -> anyhow::Result<Option<PathBuf>> {
     let cache_dir = get_model_express_cache_dir(provider);
     match provider {
         MxModelProvider::HuggingFace => {
             get_cached_model_path_in(model_name, ignore_weights, cache_dir)
         }
-        _ => get_cached_provider_model_path_in(model_name, provider, ignore_weights, &cache_dir),
+        _ => Ok(get_cached_provider_model_path_in(
+            model_name,
+            provider,
+            ignore_weights,
+            &cache_dir,
+        )),
     }
 }
 
@@ -50,15 +55,15 @@ fn get_cached_model_path_in(
     model_name: &str,
     ignore_weights: bool,
     cache_dir: PathBuf,
-) -> Option<PathBuf> {
-    let cache = Cache::new(cache_dir);
-    let repo = cache.model(model_name.to_string());
-    let snapshot_path = repo
-        .get("config.json")
-        .or_else(|| repo.get("params.json"))?
-        .parent()?
-        .to_path_buf();
-    cached_model_dir(model_name, snapshot_path, ignore_weights)
+) -> anyhow::Result<Option<PathBuf>> {
+    let repo_dir = cache_dir.join(hf_hub::Repo::model(model_name.to_owned()).folder_name());
+    let repo = Cache::new(cache_dir).model(model_name.to_owned());
+    read_hf_checkout(&repo_dir, || {
+        let snapshot = repo.get("config.json").or_else(|| repo.get("params.json"));
+        Ok(snapshot.and_then(|path| {
+            cached_model_dir(model_name, path.parent()?.to_owned(), ignore_weights)
+        }))
+    })
 }
 
 /// Look up a model in a non-HuggingFace provider's cache. ModelExpress owns the layout.
@@ -178,8 +183,11 @@ fn shard_files_present(index_path: &Path) -> io::Result<bool> {
         {
             return Ok(false);
         }
-        if checked.insert(name) && !cached_file(&snapshot_dir.join(shard))? {
-            return Ok(false);
+        if checked.insert(name) {
+            let path = snapshot_dir.join(shard);
+            if !cached_file(&path)? || same_file::is_same_file(index_path, &path)? {
+                return Ok(false);
+            }
         }
     }
     Ok(!checked.is_empty())
@@ -245,10 +253,15 @@ async fn fetch_snapshot(name: &Path, request: SnapshotRequest) -> anyhow::Result
 
     // Cache-first in all modes: if the snapshot is already on disk with the files we
     // need, return it without touching the network.
-    if matches!(request, SnapshotRequest::Model { .. })
-        && let Some(cached_path) = get_cached_model_path(&model_name, provider, ignore_weights)
-    {
-        return Ok(cached_path);
+    if matches!(request, SnapshotRequest::Model { .. }) {
+        let model = model_name.clone();
+        if let Some(path) = tokio::task::spawn_blocking(move || {
+            get_cached_model_path(&model, provider, ignore_weights)
+        })
+        .await??
+        {
+            return Ok(path);
+        }
     }
 
     let offline = is_offline_mode();
@@ -258,9 +271,9 @@ async fn fetch_snapshot(name: &Path, request: SnapshotRequest) -> anyhow::Result
         );
     }
 
-    let config = mx_client_config(provider);
-    let is_hf = MxModelProvider::resolve_provider_for_model_name(&model_name, provider)
-        == MxModelProvider::HuggingFace;
+    let actual_provider = MxModelProvider::resolve_provider_for_model_name(&model_name, provider);
+    let config = mx_client_config(actual_provider);
+    let is_hf = actual_provider == MxModelProvider::HuggingFace;
     let hf_stream_cache =
         (!config.cache.shared_storage && is_hf).then(|| get_model_express_cache_dir(provider));
     let result = match mx_download_from_server(
@@ -303,7 +316,10 @@ fn mx_client_config(provider: MxModelProvider) -> MxClientConfig {
     if is_no_shared_storage() {
         config.cache.shared_storage = false;
     }
-    if provider == MxModelProvider::Ngc {
+    if matches!(
+        provider,
+        MxModelProvider::Ngc | MxModelProvider::HuggingFace
+    ) {
         config.cache.local_path = get_model_express_cache_dir(provider);
     }
     if let Ok(endpoint) = env::var(env_model::model_express::MODEL_EXPRESS_URL) {
@@ -350,7 +366,56 @@ async fn mx_download_from_server(
         .await?;
     }
 
-    client.get_model_path(model_name, provider).await
+    // In shared storage the server already resolved the immutable revision.
+    // Use that checkout even if this client cannot contact the upstream Hub.
+    let is_hf = MxModelProvider::resolve_provider_for_model_name(model_name, provider)
+        == MxModelProvider::HuggingFace;
+    if is_hf
+        && let Some(path) = download.path
+        && let Some(rev) = &download.resolved_revision
+        && Path::new(rev).file_name() == Some(OsStr::new(rev))
+        && path.is_dir()
+    {
+        return local_hf_snapshot(model_name, path, None).await;
+    }
+    let path = client.get_model_path(model_name, provider).await?;
+    if is_hf {
+        local_hf_snapshot(model_name, path, None).await
+    } else {
+        Ok(path)
+    }
+}
+
+// Shared-storage models may use provider-specific layouts. All local HF paths
+// still wait for an in-flight publisher or recover an interrupted merge.
+async fn local_hf_snapshot(
+    model: &str,
+    path: PathBuf,
+    ignore_weights: Option<bool>,
+) -> anyhow::Result<PathBuf> {
+    let repo = hf_repo_cache_dir(model);
+    tokio::task::spawn_blocking(move || {
+        read_hf_checkout(&repo, || {
+            anyhow::ensure!(
+                path.is_dir(),
+                "Missing Hugging Face snapshot at {}",
+                path.display()
+            );
+            if let Some(ignore) = ignore_weights {
+                anyhow::ensure!(
+                    has_required_model_files(&path, ignore).with_context(|| format!(
+                        "Failed to inspect cached snapshot {}",
+                        path.display()
+                    ))?,
+                    "Cached Hugging Face snapshot at {} is incomplete",
+                    path.display()
+                );
+            }
+            Ok(())
+        })?;
+        Ok(path)
+    })
+    .await?
 }
 
 async fn create_staging(cache: &Path) -> anyhow::Result<(StreamStaging, PathBuf)> {
@@ -586,11 +651,9 @@ fn publish_hf_snapshot(
                 SnapshotRequest::Model { .. } => true,
             };
             plan_snapshot_merge(snapshot, &destination, &may_replace, &mut moves)?;
-            for (source, target) in moves {
-                fs::rename(source, &target).with_context(|| {
-                    format!("Failed to publish streamed file {}", target.display())
-                })?;
-            }
+            let journal =
+                hf_publication_lock_path(&cache_root.join(".locks"), repo).with_extension("merge");
+            install_snapshot_merge(staging, &repo_dir, &journal, &moves)?;
         }
         Err(error)
             if error.kind() == ErrorKind::NotADirectory
@@ -627,13 +690,76 @@ fn publish_hf_snapshot(
 // Both the streamed and direct download paths use this publication lock.
 fn lock_hf_publication(cache_root: &Path, repo: &OsStr) -> anyhow::Result<fs::File> {
     let locks = cache_child_dir(cache_root, OsStr::new(".locks"))?;
-    let repo_hash = blake3::hash(repo.as_encoded_bytes());
-    let lock_path = locks.join(format!("dynamo-mx-main-{repo_hash}.lock"));
+    let lock_path = hf_publication_lock_path(&locks, repo);
     let lock = open_cache_lock(&lock_path, true)
         .with_context(|| format!("Failed to open publication lock {}", lock_path.display()))?;
     lock.lock()
         .with_context(|| format!("Failed to lock {}", lock_path.display()))?;
+    let journal = lock_path.with_extension("merge");
+    if entry_exists(&journal)? {
+        let cleanup = StreamStaging::new(cache_root)?;
+        rollback_snapshot_merge(
+            &cache_root.join(repo),
+            &journal,
+            &cleanup.path().join("recovered"),
+        )
+        .with_context(|| {
+            format!(
+                "Recovering interrupted HF snapshot merge {}",
+                journal.display()
+            )
+        })?;
+    }
     Ok(lock)
+}
+
+fn hf_publication_lock_path(locks: &Path, repo: &OsStr) -> PathBuf {
+    let hash = blake3::hash(repo.as_encoded_bytes());
+    locks.join(format!("dynamo-mx-main-{hash}.lock"))
+}
+
+// Native HF caches may be read-only and have no Dynamo lock yet. Writers
+// create the persistent lock before publishing. If the first writer arrives
+// during an optimistic read, discard that capture and repeat under its lock.
+pub(super) fn read_hf_checkout<T>(
+    repo: &Path,
+    read: impl Fn() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let cache = repo.parent().context("HF repository has no cache root")?;
+    let name = repo.file_name().context("HF repository has no name")?;
+    let lock_path = hf_publication_lock_path(&cache.join(".locks"), name);
+    let open = || -> anyhow::Result<Option<fs::File>> {
+        let mut options = fs::File::options();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        match options.open(&lock_path) {
+            Ok(lock) => {
+                if !lock.metadata()?.is_file() {
+                    return Err(io::Error::other("Invalid HF publication lock").into());
+                }
+                lock.lock_shared()?;
+                if entry_exists(&lock_path.with_extension("merge"))? {
+                    drop(lock);
+                    return Ok(Some(lock_hf_publication(cache, name)?));
+                }
+                Ok(Some(lock))
+            }
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    };
+    if let Some(_guard) = open()? {
+        return read();
+    }
+    let captured = read();
+    if let Some(_guard) = open()? {
+        return read();
+    }
+    captured
 }
 
 fn main_has_complete_snapshot(main_ref: &Path, snapshots: &Path) -> io::Result<bool> {
@@ -649,6 +775,108 @@ fn main_has_complete_snapshot(main_ref: &Path, snapshots: &Path) -> io::Result<b
         return Ok(false);
     }
     has_required_model_files(&snapshots.join(revision), false)
+}
+
+// Keep backups outside the staging slot while a merge is live. A later Dynamo
+// reader or publisher can undo a worker killed between two leaf renames.
+fn install_snapshot_merge(
+    staging: &Path,
+    repo: &Path,
+    journal: &Path,
+    moves: &[(PathBuf, PathBuf)],
+) -> anyhow::Result<()> {
+    if let [(source, target)] = moves {
+        fs::rename(source, target)?;
+        return Ok(());
+    }
+    if moves.is_empty() {
+        return Ok(());
+    }
+    let prepared = staging.join("merge");
+    let mut dir = fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        dir.mode(0o700);
+    }
+    dir.create(&prepared)?;
+    let mut entries = Vec::with_capacity(moves.len());
+    for (i, (source, target)) in moves.iter().enumerate() {
+        let existed = entry_exists(target)?;
+        entries.push((target.strip_prefix(repo)?.to_owned(), existed));
+        fs::rename(source, prepared.join(i.to_string()))?;
+    }
+    fs::write(prepared.join("manifest"), serde_json::to_vec(&entries)?)?;
+    fs::rename(&prepared, journal)?;
+    let install = (|| -> io::Result<()> {
+        for (i, (relative, existed)) in entries.iter().enumerate() {
+            let target = repo.join(relative);
+            if *existed {
+                let old = journal.join(format!("{i}.old"));
+                // Keep the name readable across replacement when hard links are
+                // supported. Renaming also works on protected multi-user caches.
+                if fs::hard_link(&target, &old).is_err() {
+                    fs::rename(&target, old)?;
+                }
+            }
+            fs::rename(journal.join(i.to_string()), target)?;
+        }
+        // This rename commits the entire merge and transfers cleanup to staging.
+        fs::rename(journal, &prepared)
+    })();
+    if let Err(error) = install {
+        rollback_snapshot_merge(repo, journal, &prepared)
+            .with_context(|| format!("Recovering HF checkout after publication failed: {error}"))?;
+        return Err(error).context("Publishing HF snapshot files");
+    }
+    Ok(())
+}
+
+fn entry_exists(path: &Path) -> io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+fn rollback_snapshot_merge(repo: &Path, journal: &Path, retired: &Path) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        fs::symlink_metadata(journal)?.is_dir(),
+        "Invalid HF merge journal"
+    );
+    let entries: Vec<(PathBuf, bool)> =
+        serde_json::from_slice(&fs::read(journal.join("manifest"))?)?;
+    for (i, (relative, existed)) in entries.iter().enumerate().rev() {
+        let components: Vec<_> = relative.components().collect();
+        anyhow::ensure!(
+            matches!(components.as_slice(), [Component::Normal(prefix), Component::Normal(_), ..] if *prefix == "snapshots")
+                && components.len() >= 3
+                && components.iter().all(|c| matches!(c, Component::Normal(_))),
+            "Invalid path in HF merge journal"
+        );
+        let mut target = repo.to_owned();
+        for component in &components[..components.len() - 1] {
+            target.push(component);
+            anyhow::ensure!(
+                fs::symlink_metadata(&target)?.is_dir(),
+                "Invalid HF snapshot directory"
+            );
+        }
+        target.push(relative.file_name().context("Missing HF merge filename")?);
+        let new = journal.join(i.to_string());
+        if *existed {
+            let old = journal.join(format!("{i}.old"));
+            if entry_exists(&old)? {
+                fs::rename(old, &target)?;
+            }
+        } else if !entry_exists(&new)? {
+            fs::rename(target, new)?;
+        }
+    }
+    // The journal is replayable until it is retired in one rename.
+    fs::rename(journal, retired)?;
+    Ok(())
 }
 
 // Detect conflicts throughout an existing revision before replacing its first file.
@@ -720,14 +948,49 @@ async fn mx_download_direct(
     // publish under the same lock as a streamed download.
     if is_hf && !mx_envs::hf_offline() {
         let (staging, cache) = create_staging(&cache).await?;
+        let staged_root = staging.path().to_owned();
+        let repo = hf_repo_cache_dir(model_name);
+        let (staging, revision) = if repo.join("snapshots").is_dir() {
+            // Pin the remote commit before consulting any partial checkout.
+            // Do not seed unrelated files or let a moving main select new bytes.
+            let info = hf_hub::api::tokio::ApiBuilder::from_env()
+                .with_token(mx_envs::hf_token())
+                .with_cache_dir(staged_root.clone())
+                .build()?
+                .model(model_name.to_owned())
+                .info()
+                .await?;
+            anyhow::ensure!(
+                Path::new(&info.sha).file_name() == Some(OsStr::new(&info.sha)),
+                "Invalid HF commit identifier"
+            );
+            let commit = info.sha.clone();
+            let expected = request.clone();
+            let stage_repo =
+                staged_root.join(hf_hub::Repo::model(model_name.to_owned()).folder_name());
+            let staging = tokio::task::spawn_blocking(move || {
+                seed_hf_checkout(&repo, &stage_repo, &info, &expected)?;
+                anyhow::Ok(staging)
+            })
+            .await??;
+            (staging, Some(commit))
+        } else {
+            (staging, None)
+        };
         let result = mx::download_model_revision(
             model_name,
             provider,
-            Some(staging.path().to_owned()),
+            Some(staged_root),
             ignore_weights,
-            None,
+            revision.as_deref(),
         )
         .await?;
+        if let Some(commit) = &revision {
+            anyhow::ensure!(
+                result.resolved_revision.as_ref() == Some(commit),
+                "HF returned a different commit than the requested revision"
+            );
+        }
         let blobs = staging
             .path()
             .join(hf_hub::Repo::model(model_name.to_owned()).folder_name())
@@ -748,15 +1011,106 @@ async fn mx_download_direct(
 
     // Offline mode only resolves a path in the real cache.
     let path = mx::download_model(model_name, provider, Some(cache), ignore_weights).await?;
-    if streaming && mx_envs::hf_offline() && matches!(request, SnapshotRequest::Model { .. }) {
-        anyhow::ensure!(
-            has_required_model_files(&path, ignore_weights)
-                .with_context(|| format!("Failed to inspect cached snapshot {}", path.display()))?,
-            "Cached Hugging Face snapshot at {} is incomplete",
-            path.display()
-        );
+    if is_hf {
+        let check = (streaming && matches!(request, SnapshotRequest::Model { .. }))
+            .then_some(ignore_weights);
+        return local_hf_snapshot(model_name, path, check).await;
     }
     Ok(path)
+}
+
+// The provider's pinned hf-hub lookup reads refs/<commit> before resolving
+// snapshots/<commit>/<file>. Seed only manifest entries it would request.
+fn seed_hf_checkout(
+    repo: &Path,
+    stage_repo: &Path,
+    info: &hf_hub::api::RepoInfo,
+    request: &SnapshotRequest,
+) -> anyhow::Result<()> {
+    use modelexpress_common::providers::{
+        ModelProviderTrait, huggingface::HuggingFaceProvider as Hf,
+    };
+    let cached = repo.join("snapshots").join(&info.sha);
+    if ![repo, &repo.join("snapshots"), &cached]
+        .iter()
+        .all(|path| fs::symlink_metadata(path).is_ok_and(|m| m.is_dir()))
+    {
+        return Ok(());
+    }
+    let destination = stage_repo.join("snapshots").join(&info.sha);
+    fs::create_dir_all(
+        destination
+            .parent()
+            .context("Missing staged snapshots directory")?,
+    )?;
+    let seeded = read_hf_checkout(repo, || {
+        let seed = tempfile::tempdir_in(stage_repo)?;
+        let blob_dir = repo.join("blobs");
+        let blobs = if fs::symlink_metadata(&blob_dir).is_ok_and(|m| m.is_dir()) {
+            blob_dir.canonicalize().ok()
+        } else {
+            None
+        };
+        let refs = repo.join("refs");
+        let published = [&info.sha[..], "main"]
+            .iter()
+            .any(|name| fs::read(refs.join(name)).is_ok_and(|value| value == info.sha.as_bytes()));
+        // Every successful link pins immutable bytes; never copy large cached
+        // files just to seed. A missing/unusable entry is downloaded normally.
+        for f in &info.siblings {
+            let name = f.rfilename.as_str();
+            let rel = Path::new(name);
+            if rel.file_name() != Some(OsStr::new(name))
+                || Hf::is_ignored(name)
+                || Hf::is_image(rel)
+                || (request.ignore_weights() && Hf::is_weight_file(name))
+            {
+                continue;
+            }
+            let source = cached.join(rel);
+            let Ok(meta) = fs::symlink_metadata(&source) else {
+                continue;
+            };
+            let checksum = match request {
+                SnapshotRequest::CheckedMetadata(files) => {
+                    files.iter().find(|(n, _)| n == name).map(|(_, cf)| cf)
+                }
+                _ => None,
+            };
+            let file = if meta.is_symlink() {
+                let Ok(target) = source.canonicalize() else {
+                    continue;
+                };
+                if blobs.is_none() || target.parent() != blobs.as_deref() {
+                    continue;
+                }
+                target
+            } else if published || checksum.is_some() {
+                source
+            } else {
+                // A loose, unverified file may belong to an interrupted transfer.
+                continue;
+            };
+            if !fs::metadata(&file).is_ok_and(|m| m.is_file() && m.len() > 0) {
+                continue;
+            }
+            let pinned = seed.path().join(rel);
+            if fs::hard_link(&file, &pinned).is_err() {
+                continue;
+            }
+            if let Some(expected) = checksum
+                && crate::model_card::verify_metadata_file(&pinned, expected).is_err()
+            {
+                fs::remove_file(pinned)?;
+            }
+        }
+        Ok(seed)
+    })?;
+    fs::rename(seeded.path(), destination)?;
+    let refs = stage_repo.join("refs");
+    fs::create_dir_all(&refs)?;
+    fs::write(refs.join(&info.sha), &info.sha)?;
+    Ok(())
 }
 
 // hf-hub uses relative links into the private repository's blobs directory.
@@ -1027,7 +1381,7 @@ mod tests {
         assert_eq!(fs::read(existing.join("config.json")).unwrap(), b"{}");
         assert!(existing.join("extra.json").is_file());
         assert_eq!(
-            get_cached_model_path_in(model, false, cache.path().into()),
+            get_cached_model_path_in(model, false, cache.path().into()).unwrap(),
             Some(existing)
         );
     }
@@ -1057,7 +1411,7 @@ mod tests {
             assert_eq!(fs::read(existing.join(name)).unwrap(), b"{}");
         }
         assert_eq!(
-            get_cached_model_path_in(model, false, cache.path().into()),
+            get_cached_model_path_in(model, false, cache.path().into()).unwrap(),
             Some(existing.clone())
         );
 
@@ -1109,7 +1463,7 @@ mod tests {
         );
         assert!(!existing.with_file_name("other").exists());
         assert_eq!(
-            get_cached_model_path_in(model, false, cache.path().into()),
+            get_cached_model_path_in(model, false, cache.path().into()).unwrap(),
             Some(existing)
         );
     }
@@ -1140,14 +1494,14 @@ mod tests {
         let metadata = publish("metadata-rev", true);
         assert!(metadata.join("config.json").is_file());
         assert_eq!(
-            get_cached_model_path_in(model, false, cache.path().into()),
+            get_cached_model_path_in(model, false, cache.path().into()).unwrap(),
             Some(full.clone())
         );
 
         fs::remove_file(full.join("model.safetensors")).unwrap();
         publish("metadata-rev", true);
         assert_eq!(
-            get_cached_model_path_in(model, true, cache.path().into()),
+            get_cached_model_path_in(model, true, cache.path().into()).unwrap(),
             Some(metadata)
         );
     }
@@ -1184,7 +1538,7 @@ mod tests {
                 .is_err()
         );
         assert_eq!(
-            get_cached_model_path_in(model, true, cache.path().to_path_buf()),
+            get_cached_model_path_in(model, true, cache.path().to_path_buf()).unwrap(),
             Some(previous)
         );
     }
@@ -1222,7 +1576,7 @@ mod tests {
             b"complete"
         );
         assert_eq!(
-            get_cached_model_path_in(model, false, cache.path().to_path_buf()),
+            get_cached_model_path_in(model, false, cache.path().to_path_buf()).unwrap(),
             Some(destination)
         );
     }
@@ -1262,8 +1616,9 @@ mod tests {
         let model = "test-org/metadata-only";
         let snapshot = build_hf_cache(temp.path(), model, &["config.json", "tokenizer.json"]);
 
-        let with_weights = get_cached_model_path_in(model, false, temp.path().to_path_buf());
-        let no_weights = get_cached_model_path_in(model, true, temp.path().to_path_buf());
+        let with_weights =
+            get_cached_model_path_in(model, false, temp.path().to_path_buf()).unwrap();
+        let no_weights = get_cached_model_path_in(model, true, temp.path().to_path_buf()).unwrap();
 
         assert!(
             with_weights.is_none(),
@@ -1302,24 +1657,32 @@ mod tests {
         let model = "org/native";
         let snapshot = build_hf_cache(cache.path(), model, &["params.json", "tekken.json"]);
         assert_eq!(
-            get_cached_model_path_in(model, true, cache.path().into()),
+            get_cached_model_path_in(model, true, cache.path().into()).unwrap(),
             Some(snapshot.clone())
         );
-        assert!(get_cached_model_path_in(model, false, cache.path().into()).is_none());
+        assert!(
+            get_cached_model_path_in(model, false, cache.path().into())
+                .unwrap()
+                .is_none()
+        );
         fs::write(snapshot.join("consolidated.safetensors"), b"native weights").unwrap();
         assert_eq!(
-            get_cached_model_path_in(model, false, cache.path().into()),
+            get_cached_model_path_in(model, false, cache.path().into()).unwrap(),
             Some(snapshot.clone())
         );
         // Some repositories ship HF configuration alongside their native artifacts.
         fs::write(snapshot.join("config.json"), "{}").unwrap();
         assert_eq!(
-            get_cached_model_path_in(model, false, cache.path().into()),
+            get_cached_model_path_in(model, false, cache.path().into()).unwrap(),
             Some(snapshot.clone())
         );
         fs::remove_file(snapshot.join("params.json")).unwrap();
         fs::write(snapshot.join("tokenizer.json"), b"{}").unwrap();
-        assert!(get_cached_model_path_in(model, false, cache.path().into()).is_none());
+        assert!(
+            get_cached_model_path_in(model, false, cache.path().into())
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -1329,12 +1692,20 @@ mod tests {
         let snapshot = build_hf_cache(cache.path(), model, &["config.json"]);
         fs::create_dir(snapshot.join("tokenizer.json")).unwrap();
         fs::create_dir(snapshot.join("tokenizer.tiktoken")).unwrap();
-        assert!(get_cached_model_path_in(model, true, cache.path().to_path_buf()).is_none());
+        assert!(
+            get_cached_model_path_in(model, true, cache.path().to_path_buf())
+                .unwrap()
+                .is_none()
+        );
 
         fs::remove_dir(snapshot.join("tokenizer.json")).unwrap();
         fs::write(snapshot.join("tokenizer.json"), b"{}").unwrap();
         fs::create_dir(snapshot.join("model.safetensors")).unwrap();
-        assert!(get_cached_model_path_in(model, false, cache.path().to_path_buf()).is_none());
+        assert!(
+            get_cached_model_path_in(model, false, cache.path().to_path_buf())
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -1347,11 +1718,234 @@ mod tests {
             &["config.json", "tokenizer.json", "model.safetensors"],
         );
 
-        let with_weights = get_cached_model_path_in(model, false, temp.path().to_path_buf());
-        let no_weights = get_cached_model_path_in(model, true, temp.path().to_path_buf());
+        let with_weights =
+            get_cached_model_path_in(model, false, temp.path().to_path_buf()).unwrap();
+        let no_weights = get_cached_model_path_in(model, true, temp.path().to_path_buf()).unwrap();
 
         assert_eq!(with_weights.as_deref(), Some(snapshot.as_path()));
         assert_eq!(no_weights.as_deref(), Some(snapshot.as_path()));
+    }
+
+    #[test]
+    fn weight_index_cannot_satisfy_its_own_shard() -> anyhow::Result<()> {
+        let root = TempDir::new()?;
+        let snap = build_hf_cache(
+            root.path(),
+            "org/sharded",
+            &["config.json", "tokenizer.json"],
+        );
+        let index = snap.join("model.safetensors.index.json");
+        fs::create_dir(snap.join("nested"))?;
+        fs::write(&index, b"{}")?;
+        fs::hard_link(&index, snap.join("nested/alias.safetensors"))?;
+        for (name, expected) in [
+            ("./model.safetensors.index.json", false),
+            ("nested/alias.safetensors", false),
+            ("nested/real.safetensors", true),
+        ] {
+            fs::write(
+                &index,
+                serde_json::to_vec(&serde_json::json!({"weight_map":{"a":name}}))?,
+            )?;
+            fs::write(snap.join("nested/real.safetensors"), b"weights")?;
+            assert_eq!(has_required_model_files(&snap, false)?, expected, "{name}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn failed_late_merge_preserves_the_previous_checkout() -> anyhow::Result<()> {
+        let root = TempDir::new()?;
+        let cache = build_hf_cache(
+            root.path(),
+            "org/model",
+            &["config.json", "tokenizer.json", "model.safetensors"],
+        );
+        let repo = root.path().join("models--org--model");
+        let stage = TempDir::new_in(root.path())?;
+        let source = stage.path().join("new-config");
+        fs::write(&source, b"new")?;
+        let extra = stage.path().join("added");
+        fs::write(&extra, b"new sibling")?;
+        // Simulate a type change after planning: a directory cannot replace a file.
+        let invalid = stage.path().join("invalid");
+        fs::create_dir(&invalid)?;
+        let moves = vec![
+            (source, cache.join("config.json")),
+            (extra, cache.join("added")),
+            (invalid, cache.join("tokenizer.json")),
+        ];
+        let journal = stage.path().join("live");
+        assert!(install_snapshot_merge(stage.path(), &repo, &journal, &moves).is_err());
+        assert!(!journal.exists());
+        assert_eq!(fs::read(cache.join("config.json"))?, b"{}");
+        assert!(!cache.join("added").exists());
+        assert_eq!(
+            get_cached_model_path_in("org/model", false, root.path().into()).unwrap(),
+            Some(cache)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cache_reader_recovers_an_interrupted_same_revision_merge() -> anyhow::Result<()> {
+        let root = TempDir::new()?;
+        let model = "org/model";
+        let snapshot = build_hf_cache(
+            root.path(),
+            model,
+            &["config.json", "tokenizer.json", "model.safetensors"],
+        );
+        let repo = root.path().join("models--org--model");
+        let name = repo.file_name().unwrap();
+        let writer = lock_hf_publication(root.path(), name)?;
+        let journal =
+            hf_publication_lock_path(&root.path().join(".locks"), name).with_extension("merge");
+        fs::create_dir(&journal)?;
+        let config = snapshot.join("config.json");
+        let extra = snapshot.join("added");
+        fs::write(
+            journal.join("manifest"),
+            serde_json::to_vec(&[
+                (config.strip_prefix(&repo)?, true),
+                (extra.strip_prefix(&repo)?, false),
+            ])?,
+        )?;
+        fs::rename(&config, journal.join("0.old"))?;
+        fs::write(&config, "new config")?;
+        fs::write(&extra, "new sibling")?;
+        drop(writer); // OS releases this lock when a publishing process exits.
+        assert_eq!(
+            get_cached_model_path_in(model, false, root.path().to_owned()).unwrap(),
+            Some(snapshot)
+        );
+        assert_eq!(fs::read(config)?, b"{}");
+        assert!(!extra.exists());
+        assert!(!journal.exists());
+        fs::create_dir(&journal)?;
+        fs::write(
+            journal.join("manifest"),
+            b"interrupted or unreadable journal",
+        )?;
+        assert!(get_cached_model_path_in(model, false, root.path().to_owned()).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn checked_reader_retries_when_first_publisher_creates_its_lock() -> anyhow::Result<()> {
+        let root = TempDir::new()?;
+        let repo = root.path().join("models--org--model");
+        let snapshot = repo.join("snapshots/r");
+        fs::create_dir_all(&snapshot)?;
+        let config = snapshot.join("config.json");
+        let tokenizer = snapshot.join("tokenizer.json");
+        fs::write(&config, "old")?;
+        fs::write(&tokenizer, "old")?;
+        let n = std::cell::Cell::new(0);
+        let read = read_hf_checkout(&repo, || {
+            let first = fs::read(&config)?;
+            n.set(n.get() + 1);
+            if n.get() == 1 {
+                let _writer = lock_hf_publication(root.path(), repo.file_name().unwrap())?;
+                fs::write(&config, "new")?;
+                fs::write(&tokenizer, "new")?;
+            } else {
+                let lock_path = hf_publication_lock_path(
+                    &root.path().join(".locks"),
+                    repo.file_name().unwrap(),
+                );
+                assert!(matches!(
+                    open_cache_lock(&lock_path, false)?.try_lock(),
+                    Err(fs::TryLockError::WouldBlock)
+                ));
+            }
+            Ok((first, fs::read(&tokenizer)?))
+        })?;
+        assert_eq!(n.get(), 2);
+        assert_eq!(read, (b"new".to_vec(), b"new".to_vec()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    #[cfg(unix)]
+    async fn direct_fallback_skips_weights_cached_for_the_resolved_commit() -> anyhow::Result<()> {
+        let root = TempDir::new()?;
+        let cache = root.path().join("hub");
+        let mut hub = mockito::Server::new_async().await;
+        let endpoint = hub.url();
+        let model = "org/partial";
+        let current = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let old = build_hf_cache(&cache, model, &["config.json"]);
+        let partial = old.with_file_name(current);
+        fs::create_dir_all(&partial)?;
+        let blobs = cache.join("models--org--partial/blobs");
+        fs::create_dir_all(&blobs)?;
+        fs::write(blobs.join("weight-blob"), b"cached weights")?;
+        std::os::unix::fs::symlink("../../blobs/weight-blob", partial.join("model.safetensors"))?;
+        fs::write(partial.join("tokenizer.json"), b"truncated")?;
+        let siblings = ["config.json", "tokenizer.json", "model.safetensors"]
+            .map(|name| serde_json::json!({"rfilename":name}));
+        let info = serde_json::json!({"id":model, "sha":current, "siblings":siblings});
+        let branch_lookup = hub
+            .mock("GET", "/api/models/org/partial/revision/main")
+            .with_body(info.to_string())
+            .create_async()
+            .await;
+        let commit_lookup = hub
+            .mock(
+                "GET",
+                format!("/api/models/{model}/revision/{current}").as_str(),
+            )
+            .with_body(info.to_string())
+            .create_async()
+            .await;
+        let weights = hub
+            .mock(
+                "GET",
+                format!("/{model}/resolve/{current}/model.safetensors").as_str(),
+            )
+            .expect(0)
+            .create_async()
+            .await;
+        let mut missing = Vec::new();
+        for name in ["config.json", "tokenizer.json"] {
+            missing.push(
+                hub.mock("GET", format!("/{model}/resolve/{current}/{name}").as_str())
+                    .with_header("x-repo-commit", current)
+                    .with_header("etag", name)
+                    .with_body("{}")
+                    .expect_at_least(1)
+                    .create_async()
+                    .await,
+            );
+        }
+        temp_env::async_with_vars(
+            [
+                ("HOME", Some(root.path().as_os_str())),
+                ("HF_HUB_CACHE", Some(cache.as_os_str())),
+                ("HF_HUB_OFFLINE", None),
+                ("HF_ENDPOINT", Some(endpoint.as_ref())),
+                ("MODEL_EXPRESS_NO_SHARED_STORAGE", Some("1".as_ref())),
+                ("MODEL_EXPRESS_URL", Some("http://[".as_ref())),
+            ],
+            async {
+                assert_eq!(from_hf(model, false).await?, partial);
+                assert_eq!(
+                    fs::read(partial.join("model.safetensors"))?,
+                    b"cached weights"
+                );
+                assert_eq!(fs::read(partial.join("tokenizer.json"))?, b"{}");
+                branch_lookup.assert_async().await;
+                commit_lookup.assert_async().await;
+                weights.assert_async().await;
+                for file in missing {
+                    file.assert_async().await;
+                }
+                anyhow::Ok(())
+            },
+        )
+        .await
     }
 
     #[test]
@@ -1368,7 +1962,7 @@ mod tests {
         )
         .unwrap();
 
-        let incomplete = get_cached_model_path_in(model, false, temp.path().to_path_buf());
+        let incomplete = get_cached_model_path_in(model, false, temp.path().to_path_buf()).unwrap();
         assert!(
             incomplete.is_none(),
             "sharded cache without shard files must NOT satisfy ignore_weights=false"
@@ -1376,7 +1970,7 @@ mod tests {
 
         fs::write(snapshot.join("model-00001-of-00002.safetensors"), "").unwrap();
         fs::write(snapshot.join("model-00002-of-00002.safetensors"), "").unwrap();
-        let complete = get_cached_model_path_in(model, false, temp.path().to_path_buf());
+        let complete = get_cached_model_path_in(model, false, temp.path().to_path_buf()).unwrap();
         assert_eq!(complete.as_deref(), Some(snapshot.as_path()));
     }
 
@@ -1397,11 +1991,15 @@ mod tests {
         );
 
         assert!(
-            get_cached_model_path_in(model, true, temp.path().to_path_buf()).is_none(),
+            get_cached_model_path_in(model, true, temp.path().to_path_buf())
+                .unwrap()
+                .is_none(),
             "tokenizer_config.json alone must NOT satisfy ignore_weights=true",
         );
         assert!(
-            get_cached_model_path_in(model, false, temp.path().to_path_buf()).is_none(),
+            get_cached_model_path_in(model, false, temp.path().to_path_buf())
+                .unwrap()
+                .is_none(),
             "tokenizer_config.json alone must NOT satisfy ignore_weights=false",
         );
     }
@@ -1527,6 +2125,7 @@ mod tests {
                 async {
                     assert_eq!(
                         get_cached_model_path(NGC_TEST_MODEL, MxModelProvider::Ngc, false)
+                            .unwrap()
                             .as_deref(),
                         Some(model_dir.as_path())
                     );

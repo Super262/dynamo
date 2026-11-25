@@ -106,6 +106,7 @@ hf-hub = { workspace = true, features = ["tokio", "rustls-tls", "ureq"] }
 http-body-util = "0.1"
 ipnet = { workspace = true }
 libc = { workspace = true }
+same-file = "1"
 lru = { workspace = true }
 moka = { workspace = true }
 oneshot = { workspace = true }

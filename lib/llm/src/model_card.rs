@@ -761,11 +761,11 @@ where
     F: FnOnce(&Path) -> anyhow::Result<()>,
 {
     let tmp = unique_tmp_path(dest);
-    let mut guard = TmpGuard::new(tmp.clone());
+    let _guard = TmpGuard::new(tmp.clone());
     f(&tmp)?;
     std::fs::rename(&tmp, dest)
         .with_context(|| format!("renaming {} -> {}", tmp.display(), dest.display()))?;
-    guard.dismiss();
+    // A rename between hard links to the same inode can leave the tmp in place.
     Ok(())
 }
 
@@ -822,14 +822,9 @@ fn harvest_siblings(
     snapshot_dir: &Path,
     local_dir: &Path,
     typed_filenames: &std::collections::HashSet<String>,
-    required_checkout: bool,
 ) -> anyhow::Result<()> {
     let entries = match std::fs::read_dir(snapshot_dir) {
         Ok(e) => e,
-        Err(e) if required_checkout => {
-            return Err(e)
-                .with_context(|| format!("reading siblings from {}", snapshot_dir.display()));
-        }
         Err(e) => {
             tracing::debug!(
                 snapshot = %snapshot_dir.display(),
@@ -876,28 +871,126 @@ async fn resolve_hf_metadata_snapshot(
     repo: &str,
     files: Vec<(String, CheckedFile)>,
     blobs: &Path,
-) -> anyhow::Result<PathBuf> {
+    local: &Path,
+    typed: &std::collections::HashSet<String>,
+) -> anyhow::Result<()> {
     let files: Arc<[_]> = files.into();
     let repo_dir = crate::hub::hf_repo_cache_dir(repo);
     let blobs = blobs.to_owned();
-    let (cached, files, blobs) = tokio::task::spawn_blocking(move || {
-        (
-            cached_metadata_snapshot(&repo_dir, &files, &blobs),
-            files,
-            blobs,
-        )
+    let typed = typed.clone();
+    let (cached, files, blobs, repo_dir, typed) = tokio::task::spawn_blocking(move || {
+        let cached = crate::hub::read_hf_checkout(&repo_dir, || {
+            cached_metadata_snapshot(&repo_dir, &files, &blobs)
+                .map(|dir| capture_metadata(&dir, &files, &typed))
+                .transpose()
+        })?;
+        anyhow::Ok((cached, files, blobs, repo_dir, typed))
     })
-    .await?;
-    if let Some(snapshot) = cached {
-        return Ok(snapshot);
-    }
-    // Even a card with every typed blob cached can depend on unadvertised siblings.
-    let snapshot = crate::hub::snapshot_for_checked_metadata(repo, files.clone()).await?;
+    .await??;
+    let captured = match cached {
+        Some(captured) => captured,
+        None => {
+            let path = crate::hub::snapshot_for_checked_metadata(repo, files.clone()).await?;
+            let expected = files.clone();
+            let blob_dir = blobs.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::hub::read_hf_checkout(&repo_dir, || {
+                    matching_metadata_files(&path, &expected, Some(&blob_dir))?;
+                    capture_metadata(&path, &expected, &typed)
+                })
+            })
+            .await??
+        }
+    };
+    let local = local.to_owned();
     tokio::task::spawn_blocking(move || {
-        matching_metadata_files(&snapshot, &files, Some(&blobs))?;
-        Ok(snapshot)
+        // Native HF eviction does not take our lock. Every advertised file
+        // missing at capture time must still have a verified MDC blob.
+        for (name, cf) in files.iter() {
+            if !captured.iter().any(|(n, _, _)| n == name) {
+                verify_metadata_file(&blobs.join(cf.checksum().hash()), cf)?;
+            }
+        }
+        for (name, path, file) in captured {
+            let expected = files.iter().find(|(n, _)| *n == name).map(|(_, cf)| cf);
+            let destination = match expected {
+                Some(cf) => {
+                    let blob = blobs.join(cf.checksum().hash());
+                    if cached_blob_matches(&blob, cf) {
+                        continue;
+                    }
+                    blob
+                }
+                None => local.join(name),
+            };
+            stage_and_rename_sync(&destination, |tmp| {
+                if let Some(cf) = expected {
+                    // MDC digest blobs own their bytes, even if a native cache
+                    // user later edits the source inode in place.
+                    use std::io::Read;
+                    let cap = metadata_byte_cap(cf);
+                    let count = std::io::copy(
+                        &mut file.take(cap + 1),
+                        &mut std::fs::File::create_new(tmp)?,
+                    )?;
+                    anyhow::ensure!(count <= cap, "HF metadata exceeds size cap");
+                    verify_metadata_file(tmp, cf)
+                } else {
+                    persist_captured_file(&path, file, tmp)
+                }
+            })?;
+        }
+        Ok(())
     })
     .await?
+}
+
+// Open the selected generation's files while still holding the read lock.
+// File handles remain valid across rename and unlink, without holding a cache
+// lock during async work or borrowing a sibling symlink into a mutable checkout.
+fn capture_metadata(
+    dir: &Path,
+    expected: &[(String, CheckedFile)],
+    typed: &std::collections::HashSet<String>,
+) -> anyhow::Result<Vec<(String, PathBuf, std::fs::File)>> {
+    let mut captured = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let advertised = expected.iter().any(|(n, _)| *n == name);
+        if !advertised && (is_weight_file(&path) || typed.contains(&name)) {
+            continue;
+        }
+        if !path.is_file() {
+            continue;
+        }
+        match std::fs::File::open(&path) {
+            Ok(file) => captured.push((name, path, file)),
+            Err(error) if !advertised && error.kind() == std::io::ErrorKind::PermissionDenied => {
+                tracing::debug!(path = %path.display(), %error, "Skipping unreadable optional HF sibling");
+            }
+            Err(error) => return Err(error).with_context(|| format!("Opening {}", path.display())),
+        }
+    }
+    Ok(captured)
+}
+
+fn persist_captured_file(path: &Path, mut file: std::fs::File, tmp: &Path) -> anyhow::Result<()> {
+    // Reuse the inode when the MDC shares the HF volume. Check the identity
+    // after linking: the public path may already name a newer generation.
+    if let Ok(target) = path.canonicalize()
+        && std::fs::hard_link(target, tmp).is_ok()
+    {
+        if same_file::Handle::from_file(file.try_clone()?)? == same_file::Handle::from_path(tmp)? {
+            return Ok(());
+        }
+        std::fs::remove_file(tmp)?;
+    }
+    std::io::copy(&mut file, &mut std::fs::File::create_new(tmp)?)?;
+    Ok(())
 }
 
 fn cached_metadata_snapshot(
@@ -980,7 +1073,7 @@ pub(super) fn matching_metadata_files(
     Ok(matched)
 }
 
-fn verify_metadata_file(path: &Path, expected: &CheckedFile) -> anyhow::Result<()> {
+pub(super) fn verify_metadata_file(path: &Path, expected: &CheckedFile) -> anyhow::Result<()> {
     let meta = std::fs::metadata(path).with_context(|| format!("reading {}", path.display()))?;
     anyhow::ensure!(meta.is_file(), "{} is not a regular file", path.display());
     anyhow::ensure!(
@@ -1001,7 +1094,7 @@ fn verify_metadata_file(path: &Path, expected: &CheckedFile) -> anyhow::Result<(
 
 // Already published blobs are addressed by digest and may be shared across cards.
 fn cached_blob_matches(path: &Path, expected: &CheckedFile) -> bool {
-    CheckedFile::from_disk(path).is_ok_and(|file| file.checksum() == expected.checksum())
+    verify_metadata_file(path, expected).is_ok()
 }
 
 fn metadata_byte_cap(expected: &CheckedFile) -> u64 {
@@ -1012,15 +1105,12 @@ fn metadata_byte_cap(expected: &CheckedFile) -> u64 {
 }
 
 /// Stage `uri` into `dest`, verifying staged bytes against `expected`
-/// before publishing. Schemes: `http(s)`, `file`, `hf`. For `hf://`,
-/// `hf_snapshots` must already contain the resolved repo path —
-/// caller is expected to pre-resolve once per repo.
+/// before publishing. HF files have already been captured as a group.
 async fn resolve_uri(
     client: &reqwest::Client,
     uri: &str,
     expected: &CheckedFile,
     dest: &Path,
-    hf_snapshots: &std::collections::HashMap<String, PathBuf>,
 ) -> anyhow::Result<()> {
     let cap = metadata_byte_cap(expected);
 
@@ -1042,13 +1132,6 @@ async fn resolve_uri(
                     .to_file_path()
                     .map_err(|()| anyhow::anyhow!("invalid file:// uri: {uri}"))?;
                 copy_to_tmp(&path, &tmp, cap).await?;
-            }
-            "hf" => {
-                let (repo, filename) = parse_hf_uri(uri)?;
-                let snapshot = hf_snapshots
-                    .get(&repo)
-                    .with_context(|| format!("hf snapshot not pre-resolved for {repo}"))?;
-                copy_to_tmp(&snapshot.join(&filename), &tmp, cap).await?;
             }
             scheme => anyhow::bail!("unsupported artifact uri scheme: {scheme} (uri: {uri})"),
         }
@@ -2270,12 +2353,14 @@ impl ModelDeploymentCard {
                     .push((filename, expected.clone()));
             }
         }
-        let mut hf_snapshots = std::collections::HashMap::new();
+        let typed_filenames: std::collections::HashSet<String> = entries
+            .iter()
+            .filter_map(|(uri, _)| uri_basename(uri).ok())
+            .collect();
         for (repo, files) in hf_files {
-            let snapshot = resolve_hf_metadata_snapshot(&repo, files, &blobs)
+            resolve_hf_metadata_snapshot(&repo, files, &blobs, &local_dir, &typed_filenames)
                 .await
                 .with_context(|| format!("Failed to resolve Hugging Face metadata for {repo}"))?;
-            hf_snapshots.insert(repo, snapshot);
         }
 
         let client = reqwest::Client::builder()
@@ -2289,7 +2374,9 @@ impl ModelDeploymentCard {
             let blake3_hex = expected.checksum().hash();
             let blob = blobs.join(blake3_hex);
             tracing::debug!(filename = %filename, uri = %uri, blake3 = %blake3_hex, "resolving");
-            resolve_uri(&client, uri, expected, &blob, &hf_snapshots).await?;
+            if !uri.starts_with("hf://") {
+                resolve_uri(&client, uri, expected, &blob).await?;
+            }
             symlink_force(&blob, &local_dir.join(&filename))?;
         }
         tracing::debug!(
@@ -2302,20 +2389,14 @@ impl ModelDeploymentCard {
         // Harvest non-weight siblings (preprocessor_config.json, …) from
         // every snapshot dir we touched. Typed-slot basenames are passed
         // through so the harvest never overwrites them. No-op for `http://`.
-        let typed_filenames: std::collections::HashSet<String> = entries
-            .iter()
-            .filter_map(|(uri, _)| uri_basename(uri).ok())
-            .collect();
-        let mut snapshot_dirs: std::collections::HashSet<PathBuf> =
-            hf_snapshots.values().cloned().collect();
+        let mut snapshot_dirs = std::collections::HashSet::new();
         for (uri, _) in &entries {
             if let Some(parent) = file_uri_parent(uri) {
                 snapshot_dirs.insert(parent);
             }
         }
         for snap in &snapshot_dirs {
-            let required_checkout = hf_snapshots.values().any(|path| path == snap);
-            harvest_siblings(snap, &local_dir, &typed_filenames, required_checkout)?;
+            harvest_siblings(snap, &local_dir, &typed_filenames)?;
         }
 
         // Pass 3: rewrite cf.path to the cache symlink so downstream
@@ -3531,7 +3612,6 @@ mod tests {
             &url,
             &test_cf(&url, declared_size),
             &dest,
-            &std::collections::HashMap::new(),
         )
         .await;
         let msg = result.expect_err("expected error").to_string();
@@ -3573,15 +3653,9 @@ mod tests {
         let dest = dir.path().join("blob");
         std::fs::write(&dest, b"corrupt-bytes").unwrap();
 
-        super::resolve_uri(
-            &reqwest::Client::new(),
-            &url,
-            &cf,
-            &dest,
-            &std::collections::HashMap::new(),
-        )
-        .await
-        .expect("resolve_uri should refetch and succeed");
+        super::resolve_uri(&reqwest::Client::new(), &url, &cf, &dest)
+            .await
+            .expect("resolve_uri should refetch and succeed");
 
         let after = std::fs::read(&dest).unwrap();
         assert_eq!(after, body, "blob should have been replaced");
@@ -3624,6 +3698,27 @@ mod tests {
             )?;
         }
         Ok(snapshot)
+    }
+
+    #[test]
+    fn captured_sibling_survives_a_concurrent_revision_replacement() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let cache = root.path().join("checkout");
+        std::fs::create_dir(&cache)?;
+        let model_file = cache.join("special_tokens_map.json");
+        std::fs::write(&model_file, b"old EOS")?;
+        std::fs::write(cache.join("tokenizer.json"), b"from another source")?;
+        let typed = ["tokenizer.json".to_owned()].into_iter().collect();
+        let mut captured = super::capture_metadata(&cache, &[], &typed)?;
+        assert_eq!(captured.len(), 1);
+        let (_, path, file) = captured.pop().unwrap();
+        let next = root.path().join("next");
+        std::fs::write(&next, b"new EOS")?;
+        std::fs::rename(next, model_file)?;
+        let mdc_file = root.path().join("mdc-sibling");
+        super::persist_captured_file(&path, file, &mdc_file)?;
+        assert_eq!(std::fs::read(mdc_file)?, b"old EOS");
+        Ok(())
     }
 
     #[test]
@@ -3840,9 +3935,12 @@ mod tests {
                 );
                 assert_eq!(std::fs::read(repo.join("refs/main"))?, b"a");
 
-                // The cached typed blobs alone cannot recreate the evicted sibling.
+                // The captured sibling remains readable after the HF checkout is evicted.
                 std::fs::remove_dir_all(&repo)?;
-                assert!(!local.join("preprocessor_config.json").is_file());
+                assert_eq!(
+                    std::fs::read(local.join("preprocessor_config.json"))?,
+                    b"from B"
+                );
                 assert!(card.download_config(None).await.is_err());
                 assert_eq!(std::fs::read(local.join("config.json"))?, b"B");
                 assert_eq!(std::fs::read(local.join("tokenizer.json"))?, b"T");
@@ -4169,7 +4267,7 @@ mod tests {
         std::fs::write(snap.path().join("tokenizer.model"), b"sp")?;
         // `.safetensors.index.json` is `.json`, not a weight — must be kept.
         std::fs::write(snap.path().join("model.safetensors.index.json"), b"idx")?;
-        super::harvest_siblings(snap.path(), slug.path(), &Default::default(), true)?;
+        super::harvest_siblings(snap.path(), slug.path(), &Default::default())?;
         assert!(slug.path().join("preprocessor_config.json").exists());
         assert!(slug.path().join("tokenizer.model").exists());
         assert!(slug.path().join("model.safetensors.index.json").exists());
@@ -4184,7 +4282,7 @@ mod tests {
         for weight in ["model.safetensors", "pytorch_model.bin", "model.gguf"] {
             std::fs::write(snap.path().join(weight), b"WEIGHTS")?;
         }
-        super::harvest_siblings(snap.path(), slug.path(), &Default::default(), true)?;
+        super::harvest_siblings(snap.path(), slug.path(), &Default::default())?;
         for weight in ["model.safetensors", "pytorch_model.bin", "model.gguf"] {
             assert!(!slug.path().join(weight).exists());
         }
@@ -4199,14 +4297,12 @@ mod tests {
             &slug.path().join("does-not-exist"),
             slug.path(),
             &Default::default(),
-            false,
         )?;
         assert!(
-            super::harvest_siblings(
+            super::capture_metadata(
                 &slug.path().join("does-not-exist"),
-                slug.path(),
+                &[],
                 &Default::default(),
-                true
             )
             .is_err()
         );
@@ -4234,7 +4330,7 @@ mod tests {
 
         let typed_filenames: std::collections::HashSet<String> =
             ["config.json".to_string()].into_iter().collect();
-        super::harvest_siblings(snap.path(), slug.path(), &typed_filenames, true)?;
+        super::harvest_siblings(snap.path(), slug.path(), &typed_filenames)?;
 
         // Content equality is portable: `symlink_force` degrades to a copy
         // on non-Unix, so we can't depend on `is_symlink()`.
