@@ -804,19 +804,17 @@ fn file_uri_parent(uri: &str) -> Option<PathBuf> {
     parent.is_dir().then(|| parent.to_path_buf())
 }
 
-/// Symlink non-weight files from `snapshot_dir` into `local_dir`. Picks up
-/// `preprocessor_config.json` and other sibling files that
-/// `from_pretrained(local_dir)` consumers need.
+/// Harvest non-weight files needed by model loaders. A published generation
+/// owns its sibling bytes so later edits to external sources cannot change it.
 ///
 /// Names in `typed_filenames` are owned by the resolve loop's typed-slot
-/// pass — never overwritten. Every other harvested sibling is re-linked
-/// unconditionally so a re-registration with the same `mdcsum` but a
-/// different upstream snapshot picks up fresh contents (mdcsum doesn't
-/// cover harvested files).
+/// pass. A fresh selection picks up changes to unadvertised siblings even
+/// when the advertised files give the card the same `mdcsum`.
 fn harvest_siblings(
     snapshot_dir: &Path,
     local_dir: &Path,
     typed_filenames: &std::collections::HashSet<String>,
+    copy_into_generation: bool,
 ) -> anyhow::Result<()> {
     let entries = match std::fs::read_dir(snapshot_dir) {
         Ok(e) => e,
@@ -848,6 +846,12 @@ fn harvest_siblings(
             continue;
         }
         let dst = local_dir.join(&name);
+        if copy_into_generation {
+            if let Some(file) = open_metadata_file(&path, false)? {
+                copy_captured_file(file, &dst)?;
+            }
+            continue;
+        }
         // Resolve through the canonical target so a downstream
         // `canonicalize` lands on a stable blob path rather than
         // chasing snapshot-dir symlinks. `symlink_force` is idempotent
@@ -864,7 +868,7 @@ fn harvest_siblings(
     Ok(())
 }
 
-type CapturedMetadataFile = (String, PathBuf, std::fs::File);
+type CapturedMetadataFile = (String, std::fs::File);
 
 // A checked card can refer to a metadata-only revision even when refs/main
 // points to a different revision with weights. Select one checkout for all
@@ -907,14 +911,14 @@ async fn resolve_hf_metadata_snapshot(
         // Native HF eviction does not take our lock. Every advertised file
         // missing at capture time must still have a verified MDC blob.
         for (name, cf) in files.iter() {
-            if !captured.iter().any(|(n, _, _)| n == name) {
+            if !captured.iter().any(|(n, _)| n == name) {
                 verify_metadata_file(&blobs.join(cf.checksum().hash()), cf)?;
             }
         }
         let mut siblings = Vec::new();
-        for (name, path, file) in captured {
+        for (name, file) in captured {
             let Some((_, cf)) = files.iter().find(|(n, _)| *n == name) else {
-                siblings.push((name, path, file));
+                siblings.push((name, file));
                 continue;
             };
             let destination = blobs.join(cf.checksum().hash());
@@ -960,30 +964,38 @@ fn capture_metadata(
         if !path.is_file() {
             continue;
         }
-        match std::fs::File::open(&path) {
-            Ok(file) => captured.push((name, path, file)),
-            Err(error) if !advertised && error.kind() == std::io::ErrorKind::PermissionDenied => {
-                tracing::debug!(path = %path.display(), %error, "Skipping unreadable optional HF sibling");
-            }
-            Err(error) => return Err(error).with_context(|| format!("Opening {}", path.display())),
+        if let Some(file) = open_metadata_file(&path, advertised)? {
+            captured.push((name, file));
         }
     }
     Ok(captured)
 }
 
-fn persist_captured_file(path: &Path, mut file: std::fs::File, tmp: &Path) -> anyhow::Result<()> {
-    // Reuse the inode when the MDC shares the HF volume. Check the identity
-    // after linking: the public path may already name a newer generation.
-    if let Ok(target) = path.canonicalize()
-        && std::fs::hard_link(target, tmp).is_ok()
-    {
-        if same_file::Handle::from_file(file.try_clone()?)? == same_file::Handle::from_path(tmp)? {
-            return Ok(());
+fn open_metadata_file(path: &Path, advertised: bool) -> anyhow::Result<Option<std::fs::File>> {
+    use std::io::ErrorKind;
+
+    match std::fs::File::open(path) {
+        Ok(file) => Ok(Some(file)),
+        Err(error)
+            if !advertised
+                && matches!(
+                    error.kind(),
+                    ErrorKind::NotFound | ErrorKind::PermissionDenied
+                ) =>
+        {
+            tracing::debug!(path = %path.display(), %error, "Skipping unavailable metadata sibling");
+            Ok(None)
         }
-        std::fs::remove_file(tmp)?;
+        Err(error) => Err(error).with_context(|| format!("Opening {}", path.display())),
     }
-    std::io::copy(&mut file, &mut std::fs::File::create_new(tmp)?)?;
-    Ok(())
+}
+
+fn copy_captured_file(mut file: std::fs::File, dest: &Path) -> anyhow::Result<()> {
+    stage_and_rename_sync(dest, |tmp| {
+        std::io::copy(&mut file, &mut std::fs::File::create_new(tmp)?)?;
+        Ok(())
+    })
+    .with_context(|| format!("Publishing metadata sibling {}", dest.display()))
 }
 
 fn mdc_generation_digest(dir: &Path) -> anyhow::Result<blake3::Hash> {
@@ -1032,10 +1044,11 @@ fn publish_mdc_generation(
 
     let mut repair = 0_u64;
     loop {
+        // Old generations could contain hardlinked or externally linked siblings.
         let name = if repair == 0 {
-            digest.to_hex().to_string()
+            format!("v2-{digest}")
         } else {
-            format!("{digest}-{repair}")
+            format!("v2-{digest}-{repair}")
         };
         let destination = generations.join(name);
         let metadata = match fs::symlink_metadata(&destination) {
@@ -1057,6 +1070,40 @@ fn publish_mdc_generation(
         // Keep existing card paths intact and try the next repair slot.
         repair += 1;
     }
+}
+
+fn verify_mdc_generation(dir: &Path) -> anyhow::Result<()> {
+    let key = dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix("v2-"))
+        .with_context(|| {
+            format!(
+                "Legacy MDC generation at {} cannot guarantee sibling integrity; re-resolve the original model card",
+                dir.display()
+            )
+        })?;
+    let digest = key.split_once('-').map_or(key, |(digest, _)| digest);
+    let expected = blake3::Hash::from_hex(digest).context("Invalid MDC generation digest")?;
+    anyhow::ensure!(
+        std::fs::symlink_metadata(dir)
+            .with_context(|| format!("Reading MDC generation directory {}", dir.display()))?
+            .is_dir(),
+        "Invalid MDC generation directory at {}; re-resolve the original model card",
+        dir.display()
+    );
+    let actual = mdc_generation_digest(dir).with_context(|| {
+        format!(
+            "Damaged MDC generation at {}; re-resolve the original model card",
+            dir.display()
+        )
+    })?;
+    anyhow::ensure!(
+        actual == expected,
+        "Damaged MDC generation at {}; re-resolve the original model card",
+        dir.display()
+    );
+    Ok(())
 }
 
 fn cached_metadata_snapshot(
@@ -1174,7 +1221,6 @@ async fn resolve_uri(
             return Ok(());
         }
         tracing::warn!(dest = %dest.display(), "MDC cache blob failed re-verification; refetching");
-        let _ = std::fs::remove_file(dest);
     }
 
     stage_and_rename(dest, |tmp| async move {
@@ -2459,6 +2505,10 @@ impl ModelDeploymentCard {
             .filter_map(|(uri, _)| file_uri_parent(uri))
             .collect();
         let local_dir = tokio::task::spawn_blocking(move || {
+            if hf_siblings.is_empty() && local_dir.parent() == Some(generations.as_path()) {
+                verify_mdc_generation(&local_dir)?;
+                return Ok(local_dir);
+            }
             let staged = if hf_siblings.is_empty() {
                 std::fs::create_dir_all(&local_dir)?;
                 None
@@ -2473,10 +2523,8 @@ impl ModelDeploymentCard {
                 symlink_force(&blob, &publish_dir.join(name))?;
             }
             for siblings in hf_siblings {
-                for (name, source, file) in siblings {
-                    stage_and_rename_sync(&publish_dir.join(name), |tmp| {
-                        persist_captured_file(&source, file, tmp)
-                    })?;
+                for (name, file) in siblings {
+                    copy_captured_file(file, &publish_dir.join(name))?;
                 }
             }
             for snap in snapshot_dirs {
@@ -2488,7 +2536,7 @@ impl ModelDeploymentCard {
                 {
                     continue;
                 }
-                harvest_siblings(&snap, publish_dir, &typed_filenames)?;
+                harvest_siblings(&snap, publish_dir, &typed_filenames, staged.is_some())?;
             }
             match staged {
                 Some(staged) => publish_mdc_generation(staged, &generations),
@@ -3730,7 +3778,32 @@ mod tests {
         assert_resolve_uri_rejects(b"x".repeat(35).as_slice(), 8, "exceeds cap").await;
     }
 
-    /// Cache hit re-verifies the on-disk blob; mismatch → unlink + refetch.
+    #[tokio::test]
+    async fn conflicting_size_keeps_other_cards_blob_readable() -> anyhow::Result<()> {
+        let cache = tempfile::tempdir()?;
+        let source = cache.path().join("source.json");
+        let contents = b"shared config";
+        std::fs::write(&source, contents)?;
+        let expected = super::CheckedFile::from_disk(&source)?;
+        let blob = cache.path().join(expected.checksum().hash());
+        let client = reqwest::Client::new();
+        let url = url::Url::from_file_path(source).unwrap();
+        super::resolve_uri(&client, url.as_str(), &expected, &blob).await?;
+        let first_card = cache.path().join("config.json");
+        super::symlink_force(&blob, &first_card)?;
+
+        let mut wire = serde_json::to_value(&expected)?;
+        wire["size"] = serde_json::json!(1);
+        let conflicting = serde_json::from_value(wire)?;
+        let error = super::resolve_uri(&client, url.as_str(), &conflicting, &blob)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("exceeds cap"), "{error:#}");
+        assert_eq!(std::fs::read(first_card)?, contents);
+        Ok(())
+    }
+
+    /// A mismatched cache entry is replaced after the refetched bytes verify.
     #[tokio::test]
     async fn resolve_uri_refetches_on_cache_hit_mismatch() {
         let body: &[u8] = b"valid-bytes-for-blob";
@@ -3809,13 +3882,36 @@ mod tests {
         let typed = ["tokenizer.json".to_owned()].into_iter().collect();
         let mut captured = super::capture_metadata(&cache, &[], &typed)?;
         assert_eq!(captured.len(), 1);
-        let (_, path, file) = captured.pop().unwrap();
+        let (_, file) = captured.pop().unwrap();
         let next = root.path().join("next");
         std::fs::write(&next, b"new EOS")?;
-        std::fs::rename(next, model_file)?;
+        std::fs::rename(next, &model_file)?;
         let mdc_file = root.path().join("mdc-sibling");
-        super::persist_captured_file(&path, file, &mdc_file)?;
-        assert_eq!(std::fs::read(mdc_file)?, b"old EOS");
+        super::copy_captured_file(file, &mdc_file)?;
+        assert_eq!(std::fs::read(&mdc_file)?, b"old EOS");
+
+        let mdc_file = root.path().join("mdc-sibling-next");
+        let (_, file) = super::capture_metadata(&cache, &[], &typed)?.pop().unwrap();
+        super::copy_captured_file(file, &mdc_file)?;
+        std::fs::write(&model_file, b"edited EOS")?;
+        assert_eq!(std::fs::read(mdc_file)?, b"new EOS");
+        Ok(())
+    }
+
+    #[test]
+    fn sibling_evicted_before_open_is_ignored_only_when_optional() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let sibling = root.path().join("metadata.json");
+        std::fs::write(&sibling, b"old sibling")?;
+        assert!(sibling.is_file());
+        std::fs::remove_file(&sibling)?;
+
+        assert!(super::open_metadata_file(&sibling, false)?.is_none());
+        let error = super::open_metadata_file(&sibling, true).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::NotFound
+        );
         Ok(())
     }
 
@@ -3829,7 +3925,7 @@ mod tests {
         std::os::unix::fs::symlink(&local, &alias)?;
         let sibling = local.join("special_tokens_map.json");
         std::fs::write(&sibling, b"local EOS")?;
-        super::harvest_siblings(&alias, &local, &Default::default())?;
+        super::harvest_siblings(&alias, &local, &Default::default(), false)?;
         assert_eq!(std::fs::read(sibling)?, b"local EOS");
         Ok(())
     }
@@ -3985,6 +4081,19 @@ mod tests {
                         .eos_token_ids()
                         .contains(&200)
                 );
+                let sibling = cold.local_dir().join("special_tokens_map.json");
+                std::fs::write(&sibling, b"edited sibling")?;
+                let error = cold.download_config(None).await.unwrap_err();
+                assert!(
+                    error.to_string().contains("Damaged MDC generation"),
+                    "{error:#}"
+                );
+                std::fs::remove_file(sibling)?;
+                let error = cold.download_config(None).await.unwrap_err();
+                assert!(
+                    error.to_string().contains("Damaged MDC generation"),
+                    "{error:#}"
+                );
                 std::fs::remove_dir_all(cold.local_dir())?;
 
                 // A present, conflicting tokenizer cannot be excused by a valid shared blob.
@@ -4046,6 +4155,13 @@ mod tests {
                     HFConfig::from_json_file(previous_local.join("config.json"))?.eos_token_ids(),
                     [1]
                 );
+
+                std::fs::write(external.join("external.json"), b"external sibling edited")?;
+                assert_eq!(
+                    std::fs::read(previous_local.join("external.json"))?,
+                    b"external sibling"
+                );
+                std::fs::write(external.join("external.json"), b"external sibling")?;
 
                 let legacy = super::mdc_local_path(card.slug(), card.mdcsum());
                 std::fs::create_dir_all(&legacy)?;
@@ -4501,7 +4617,7 @@ mod tests {
         std::fs::write(snap.path().join("tokenizer.model"), b"sp")?;
         // `.safetensors.index.json` is `.json`, not a weight — must be kept.
         std::fs::write(snap.path().join("model.safetensors.index.json"), b"idx")?;
-        super::harvest_siblings(snap.path(), slug.path(), &Default::default())?;
+        super::harvest_siblings(snap.path(), slug.path(), &Default::default(), false)?;
         assert!(slug.path().join("preprocessor_config.json").exists());
         assert!(slug.path().join("tokenizer.model").exists());
         assert!(slug.path().join("model.safetensors.index.json").exists());
@@ -4516,7 +4632,7 @@ mod tests {
         for weight in ["model.safetensors", "pytorch_model.bin", "model.gguf"] {
             std::fs::write(snap.path().join(weight), b"WEIGHTS")?;
         }
-        super::harvest_siblings(snap.path(), slug.path(), &Default::default())?;
+        super::harvest_siblings(snap.path(), slug.path(), &Default::default(), false)?;
         for weight in ["model.safetensors", "pytorch_model.bin", "model.gguf"] {
             assert!(!slug.path().join(weight).exists());
         }
@@ -4531,6 +4647,7 @@ mod tests {
             &slug.path().join("does-not-exist"),
             slug.path(),
             &Default::default(),
+            false,
         )?;
         assert!(
             super::capture_metadata(
@@ -4564,7 +4681,7 @@ mod tests {
 
         let typed_filenames: std::collections::HashSet<String> =
             ["config.json".to_string()].into_iter().collect();
-        super::harvest_siblings(snap.path(), slug.path(), &typed_filenames)?;
+        super::harvest_siblings(snap.path(), slug.path(), &typed_filenames, false)?;
 
         // Content equality is portable: `symlink_force` degrades to a copy
         // on non-Unix, so we can't depend on `is_symlink()`.
