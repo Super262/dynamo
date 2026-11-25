@@ -822,9 +822,14 @@ fn harvest_siblings(
     snapshot_dir: &Path,
     local_dir: &Path,
     typed_filenames: &std::collections::HashSet<String>,
+    required_checkout: bool,
 ) -> anyhow::Result<()> {
     let entries = match std::fs::read_dir(snapshot_dir) {
         Ok(e) => e,
+        Err(e) if required_checkout => {
+            return Err(e)
+                .with_context(|| format!("reading siblings from {}", snapshot_dir.display()));
+        }
         Err(e) => {
             tracing::debug!(
                 snapshot = %snapshot_dir.display(),
@@ -871,62 +876,108 @@ async fn resolve_hf_metadata_snapshot(
     repo: &str,
     files: Vec<(String, CheckedFile)>,
     blobs: &Path,
-) -> anyhow::Result<Option<PathBuf>> {
+) -> anyhow::Result<PathBuf> {
+    let files: Arc<[_]> = files.into();
     let repo_dir = crate::hub::hf_repo_cache_dir(repo);
     let blobs = blobs.to_owned();
-    let (files, cached, have_blobs) = tokio::task::spawn_blocking(move || {
-        let cached = cached_metadata_snapshot(&repo_dir, &files);
-        let have_blobs = cached.is_none()
-            && files
-                .iter()
-                .all(|(_, cf)| cached_blob_matches(&blobs.join(cf.checksum().hash()), cf));
-        (files, cached, have_blobs)
+    let (cached, files, blobs) = tokio::task::spawn_blocking(move || {
+        (
+            cached_metadata_snapshot(&repo_dir, &files, &blobs),
+            files,
+            blobs,
+        )
     })
     .await?;
-    if cached.is_some() || have_blobs {
-        return Ok(cached);
+    if let Some(snapshot) = cached {
+        return Ok(snapshot);
     }
-    // Shared storage can return a checkout outside the standard HF cache layout.
-    let snapshot = crate::hub::snapshot_for_checked_metadata(repo).await?;
+    // Even a card with every typed blob cached can depend on unadvertised siblings.
+    let snapshot = crate::hub::snapshot_for_checked_metadata(repo, files.clone()).await?;
     tokio::task::spawn_blocking(move || {
-        verify_metadata_snapshot(&snapshot, &files)?;
-        Ok(Some(snapshot))
+        matching_metadata_files(&snapshot, &files, Some(&blobs))?;
+        Ok(snapshot)
     })
     .await?
 }
 
-fn cached_metadata_snapshot(repo_dir: &Path, files: &[(String, CheckedFile)]) -> Option<PathBuf> {
+fn cached_metadata_snapshot(
+    repo_dir: &Path,
+    files: &[(String, CheckedFile)],
+    blobs: &Path,
+) -> Option<PathBuf> {
     let snapshots = repo_dir.join("snapshots");
     let main = std::fs::read_to_string(repo_dir.join("refs/main"))
         .ok()
         .filter(|rev| Path::new(rev).file_name() == Some(rev.as_ref()))
         .map(|rev| snapshots.join(rev));
+    let mut best = None;
+    let mut matched = 0;
+    let mut consider = |path: &Path| {
+        if let Ok(count) = matching_metadata_files(path, files, Some(blobs))
+            && count > matched
+        {
+            matched = count;
+            best = Some(path.to_owned());
+        }
+        matched == files.len()
+    };
     if let Some(path) = &main
-        && verify_metadata_snapshot(path, files).is_ok()
+        && consider(path)
     {
         return main;
     }
-    let mut candidates: Vec<_> = std::fs::read_dir(snapshots)
-        .ok()?
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
-        .map(|entry| entry.path())
-        .filter(|path| Some(path) != main.as_ref())
-        .collect();
-    candidates.sort_unstable();
-    candidates
-        .into_iter()
-        .find(|dir| verify_metadata_snapshot(dir, files).is_ok())
+    if let Ok(entries) = std::fs::read_dir(snapshots) {
+        let mut candidates: Vec<_> = entries
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+            .filter(|entry| Some(&entry.path()) != main.as_ref())
+            .collect();
+        // Follow ModelExpress's offline preference when checksums cannot
+        // distinguish revisions that have different unadvertised siblings.
+        candidates.sort_by_cached_key(|entry| {
+            let time = entry
+                .metadata()
+                .and_then(|meta| meta.created().or_else(|_| meta.modified()))
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            (std::cmp::Reverse(time), entry.file_name())
+        });
+        for entry in candidates {
+            if consider(&entry.path()) {
+                break;
+            }
+        }
+    }
+    best
 }
 
-fn verify_metadata_snapshot(
+// A missing local file can be supplied by its verified MDC blob. A conflicting
+// file rules out the entire checkout, including its unadvertised siblings.
+// A freshly downloaded private stage must supply every advertised file itself.
+pub(super) fn matching_metadata_files(
     snapshot: &Path,
     files: &[(String, CheckedFile)],
-) -> anyhow::Result<()> {
+    blobs: Option<&Path>,
+) -> anyhow::Result<usize> {
+    let mut matched = 0;
     for (name, expected) in files {
-        verify_metadata_file(&snapshot.join(name), expected)?;
+        match verify_metadata_file(&snapshot.join(name), expected) {
+            Ok(()) => matched += 1,
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+                    && blobs.is_some_and(|dir| {
+                        cached_blob_matches(&dir.join(expected.checksum().hash()), expected)
+                    }) => {}
+            Err(error) => return Err(error),
+        }
     }
-    Ok(())
+    anyhow::ensure!(
+        matched > 0,
+        "No advertised metadata file identifies the checkout at {}",
+        snapshot.display()
+    );
+    Ok(matched)
 }
 
 fn verify_metadata_file(path: &Path, expected: &CheckedFile) -> anyhow::Result<()> {
@@ -2221,12 +2272,10 @@ impl ModelDeploymentCard {
         }
         let mut hf_snapshots = std::collections::HashMap::new();
         for (repo, files) in hf_files {
-            if let Some(snapshot) = resolve_hf_metadata_snapshot(&repo, files, &blobs)
+            let snapshot = resolve_hf_metadata_snapshot(&repo, files, &blobs)
                 .await
-                .with_context(|| format!("Failed to resolve Hugging Face metadata for {repo}"))?
-            {
-                hf_snapshots.insert(repo, snapshot);
-            }
+                .with_context(|| format!("Failed to resolve Hugging Face metadata for {repo}"))?;
+            hf_snapshots.insert(repo, snapshot);
         }
 
         let client = reqwest::Client::builder()
@@ -2265,7 +2314,8 @@ impl ModelDeploymentCard {
             }
         }
         for snap in &snapshot_dirs {
-            harvest_siblings(snap, &local_dir, &typed_filenames)?;
+            let required_checkout = hf_snapshots.values().any(|path| path == snap);
+            harvest_siblings(snap, &local_dir, &typed_filenames, required_checkout)?;
         }
 
         // Pass 3: rewrite cf.path to the cache symlink so downstream
@@ -3576,6 +3626,167 @@ mod tests {
         Ok(snapshot)
     }
 
+    #[test]
+    fn no_ref_prefers_recent_matching_revision_for_legacy_siblings() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let old = root.path().join("snapshots/a");
+        let new = root.path().join("snapshots/z");
+        for dir in [&old, &new] {
+            std::fs::create_dir_all(dir)?;
+            std::fs::write(dir.join("config.json"), b"same config")?;
+            std::fs::write(
+                dir.join("special_tokens_map.json"),
+                dir.file_name().unwrap().as_encoded_bytes(),
+            )?;
+        }
+        let files = [(
+            "config.json".to_owned(),
+            CheckedFile::from_disk(old.join("config.json"))?,
+        )];
+        let selected = super::cached_metadata_snapshot(root.path(), &files, root.path()).unwrap();
+        // Filesystems with coarse creation timestamps use the stable name tie-break.
+        let stamp = |p: &Path| -> std::io::Result<_> {
+            let meta = std::fs::metadata(p)?;
+            meta.created().or_else(|_| meta.modified())
+        };
+        let expected: &[u8] = if stamp(&new)? > stamp(&old)? {
+            b"z"
+        } else {
+            b"a"
+        };
+        assert_eq!(
+            std::fs::read(selected.join("special_tokens_map.json"))?,
+            expected
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn warm_blobs_refetch_evicted_checkout_for_unadvertised_eos() -> anyhow::Result<()> {
+        let home = tempfile::tempdir()?;
+        let cache = home.path().join("hub");
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/data/sample-models/mock-special-tokens-only");
+        let names = ["config.json", "tokenizer.json", "special_tokens_map.json"];
+        let mut hub = mockito::Server::new_async().await;
+        let endpoint = hub.url();
+        let revision = "0123456789012345678901234567890123456789";
+        let info = serde_json::json!({"id":"org/legacy", "sha":revision,
+            "siblings":names.map(|name| serde_json::json!({"rfilename":name}))});
+        let lookup = hub
+            .mock("GET", "/api/models/org/legacy/revision/main")
+            .with_body(info.to_string())
+            .create_async()
+            .await;
+        let mut artifacts = Vec::new();
+        for name in names {
+            let route = format!("/org/legacy/resolve/{revision}/{name}");
+            artifacts.push(
+                hub.mock("GET", route.as_str())
+                    .with_header("x-repo-commit", revision)
+                    .with_header("etag", name)
+                    .with_body_from_file(fixture.join(name))
+                    .expect_at_least(1)
+                    .create_async()
+                    .await,
+            );
+        }
+
+        let config = CheckedFile::from_disk(fixture.join("config.json"))?;
+        let tokenizer = CheckedFile::from_disk(fixture.join("tokenizer.json"))?;
+        let mut card = ModelDeploymentCard::with_name_only("org/legacy");
+        card.model_info = Some(super::ModelInfoType::HfConfigJson(config.clone()));
+        card.tokenizer = Some(super::TokenizerKind::HfTokenizerJson(tokenizer.clone()));
+        card.move_to_url("hf://org/legacy/")?;
+        temp_env::async_with_vars(
+            [
+                ("HOME", Some(home.path().as_os_str())),
+                ("HF_HUB_CACHE", Some(cache.as_os_str())),
+                ("HF_HUB_OFFLINE", None),
+                ("HF_ENDPOINT", Some(endpoint.as_ref())),
+                ("MODEL_EXPRESS_NO_SHARED_STORAGE", Some("1".as_ref())),
+                ("MODEL_EXPRESS_URL", Some("http://[".as_ref())),
+            ],
+            async {
+                let blobs = super::mdc_blobs_dir()?;
+                for cf in [config, tokenizer] {
+                    std::fs::copy(cf.path().unwrap(), blobs.join(cf.checksum().hash()))?;
+                }
+                card.download_config(None).await?;
+                assert!(
+                    HFConfig::from_json_file(card.local_dir().join("config.json"))?
+                        .eos_token_ids()
+                        .contains(&200)
+                );
+                lookup.assert_async().await;
+                for artifact in artifacts {
+                    artifact.assert_async().await;
+                }
+                anyhow::Ok(())
+            },
+        )
+        .await
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sparse_checkout_and_verified_blob_supply_legacy_eos() -> anyhow::Result<()> {
+        let home = tempfile::tempdir()?;
+        let cache = home.path().join("hub");
+        let repo = cache.join("models--org--legacy");
+        let snap = repo.join("snapshots/rev");
+        std::fs::create_dir_all(&snap)?;
+        std::fs::create_dir_all(repo.join("refs"))?;
+        std::fs::write(repo.join("refs/main"), b"rev")?;
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/data/sample-models/mock-special-tokens-only");
+        for name in ["config.json", "special_tokens_map.json"] {
+            std::fs::copy(fixture.join(name), snap.join(name))?;
+        }
+        let tokenizer = CheckedFile::from_disk(fixture.join("tokenizer.json"))?;
+        let mut card = ModelDeploymentCard::with_name_only("org/legacy");
+        card.model_info = Some(super::ModelInfoType::HfConfigJson(CheckedFile::from_disk(
+            snap.join("config.json"),
+        )?));
+        card.tokenizer = Some(super::TokenizerKind::HfTokenizerJson(tokenizer.clone()));
+        card.move_to_url("hf://org/legacy/")?;
+        temp_env::async_with_vars(
+            [
+                ("HOME", Some(home.path().as_os_str())),
+                ("HF_HUB_CACHE", Some(cache.as_os_str())),
+                ("HF_HUB_OFFLINE", Some("1".as_ref())),
+                ("MODEL_EXPRESS_NO_SHARED_STORAGE", Some("1".as_ref())),
+                ("MODEL_EXPRESS_URL", Some("http://[".as_ref())),
+            ],
+            async {
+                std::fs::copy(
+                    fixture.join("tokenizer.json"),
+                    super::mdc_blobs_dir()?.join(tokenizer.checksum().hash()),
+                )?;
+                let mut cold = card.clone();
+                cold.download_config(None).await?;
+                assert!(
+                    HFConfig::from_json_file(cold.local_dir().join("config.json"))?
+                        .eos_token_ids()
+                        .contains(&200)
+                );
+                std::fs::remove_dir_all(cold.local_dir())?;
+
+                // A present, conflicting tokenizer cannot be excused by a valid shared blob.
+                std::fs::write(snap.join("tokenizer.json"), b"wrong revision")?;
+                assert!(card.clone().download_config(None).await.is_err());
+                std::fs::remove_file(snap.join("tokenizer.json"))?;
+                card.download_config(None).await?;
+                let cfg = HFConfig::from_json_file(card.local_dir().join("config.json"))?;
+                assert!(cfg.eos_token_ids().contains(&200));
+                assert_eq!(cfg.bos_token_id(), Some(201));
+                Ok(())
+            },
+        )
+        .await
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn download_config_selects_one_cached_revision_by_checksum() -> anyhow::Result<()> {
@@ -3629,9 +3840,10 @@ mod tests {
                 );
                 assert_eq!(std::fs::read(repo.join("refs/main"))?, b"a");
 
-                // The typed, content-addressed blobs survive eviction of the HF checkout.
+                // The cached typed blobs alone cannot recreate the evicted sibling.
                 std::fs::remove_dir_all(&repo)?;
-                card.download_config(None).await?;
+                assert!(!local.join("preprocessor_config.json").is_file());
+                assert!(card.download_config(None).await.is_err());
                 assert_eq!(std::fs::read(local.join("config.json"))?, b"B");
                 assert_eq!(std::fs::read(local.join("tokenizer.json"))?, b"T");
                 Ok(())
@@ -3957,7 +4169,7 @@ mod tests {
         std::fs::write(snap.path().join("tokenizer.model"), b"sp")?;
         // `.safetensors.index.json` is `.json`, not a weight — must be kept.
         std::fs::write(snap.path().join("model.safetensors.index.json"), b"idx")?;
-        super::harvest_siblings(snap.path(), slug.path(), &Default::default())?;
+        super::harvest_siblings(snap.path(), slug.path(), &Default::default(), true)?;
         assert!(slug.path().join("preprocessor_config.json").exists());
         assert!(slug.path().join("tokenizer.model").exists());
         assert!(slug.path().join("model.safetensors.index.json").exists());
@@ -3972,7 +4184,7 @@ mod tests {
         for weight in ["model.safetensors", "pytorch_model.bin", "model.gguf"] {
             std::fs::write(snap.path().join(weight), b"WEIGHTS")?;
         }
-        super::harvest_siblings(snap.path(), slug.path(), &Default::default())?;
+        super::harvest_siblings(snap.path(), slug.path(), &Default::default(), true)?;
         for weight in ["model.safetensors", "pytorch_model.bin", "model.gguf"] {
             assert!(!slug.path().join(weight).exists());
         }
@@ -3987,7 +4199,17 @@ mod tests {
             &slug.path().join("does-not-exist"),
             slug.path(),
             &Default::default(),
+            false,
         )?;
+        assert!(
+            super::harvest_siblings(
+                &slug.path().join("does-not-exist"),
+                slug.path(),
+                &Default::default(),
+                true
+            )
+            .is_err()
+        );
         Ok(())
     }
 
@@ -4012,7 +4234,7 @@ mod tests {
 
         let typed_filenames: std::collections::HashSet<String> =
             ["config.json".to_string()].into_iter().collect();
-        super::harvest_siblings(snap.path(), slug.path(), &typed_filenames)?;
+        super::harvest_siblings(snap.path(), slug.path(), &typed_filenames, true)?;
 
         // Content equality is portable: `symlink_force` degrades to a copy
         // on non-Unix, so we can't depend on `is_symlink()`.
