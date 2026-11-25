@@ -676,9 +676,7 @@ fn mdc_blobs_dir() -> anyhow::Result<PathBuf> {
     Ok(dir)
 }
 
-/// Per-MDC cache directory: `<root>/by-slug/<slug>/<mdcsum>/`.
-/// Pure path computation; use [`mdc_local_dir`] when you need the
-/// directory created.
+/// Flat MDC cache location used by local cards and older clients.
 fn mdc_local_path(slug: &Slug, mdcsum: &str) -> PathBuf {
     mdc_cache_root()
         .join("by-slug")
@@ -686,11 +684,8 @@ fn mdc_local_path(slug: &Slug, mdcsum: &str) -> PathBuf {
         .join(mdcsum)
 }
 
-fn mdc_local_dir(slug: &Slug, mdcsum: &str) -> anyhow::Result<PathBuf> {
-    let dir = mdc_local_path(slug, mdcsum);
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("creating MDC local dir {}", dir.display()))?;
-    Ok(dir)
+fn mdc_hf_generations(local: &Path) -> PathBuf {
+    local.with_extension("hf-generations")
 }
 
 /// Per-call tmp path next to `dest`. pid + uuid suffix keeps tmps
@@ -834,6 +829,11 @@ fn harvest_siblings(
             return Ok(());
         }
     };
+    // Re-resolving a card turns its advertised paths into file:// URLs.
+    // Never turn its already-local siblings into links to themselves.
+    if same_file::is_same_file(snapshot_dir, local_dir)? {
+        return Ok(());
+    }
     for entry in entries {
         let entry = entry?;
         let path = entry.path();
@@ -864,6 +864,8 @@ fn harvest_siblings(
     Ok(())
 }
 
+type CapturedMetadataFile = (String, PathBuf, std::fs::File);
+
 // A checked card can refer to a metadata-only revision even when refs/main
 // points to a different revision with weights. Select one checkout for all
 // advertised files so that harvested siblings also come from that revision.
@@ -871,9 +873,8 @@ async fn resolve_hf_metadata_snapshot(
     repo: &str,
     files: Vec<(String, CheckedFile)>,
     blobs: &Path,
-    local: &Path,
     typed: &std::collections::HashSet<String>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<CapturedMetadataFile>> {
     let files: Arc<[_]> = files.into();
     let repo_dir = crate::hub::hf_repo_cache_dir(repo);
     let blobs = blobs.to_owned();
@@ -902,7 +903,6 @@ async fn resolve_hf_metadata_snapshot(
             .await??
         }
     };
-    let local = local.to_owned();
     tokio::task::spawn_blocking(move || {
         // Native HF eviction does not take our lock. Every advertised file
         // missing at capture time must still have a verified MDC blob.
@@ -911,36 +911,29 @@ async fn resolve_hf_metadata_snapshot(
                 verify_metadata_file(&blobs.join(cf.checksum().hash()), cf)?;
             }
         }
+        let mut siblings = Vec::new();
         for (name, path, file) in captured {
-            let expected = files.iter().find(|(n, _)| *n == name).map(|(_, cf)| cf);
-            let destination = match expected {
-                Some(cf) => {
-                    let blob = blobs.join(cf.checksum().hash());
-                    if cached_blob_matches(&blob, cf) {
-                        continue;
-                    }
-                    blob
-                }
-                None => local.join(name),
+            let Some((_, cf)) = files.iter().find(|(n, _)| *n == name) else {
+                siblings.push((name, path, file));
+                continue;
             };
+            let destination = blobs.join(cf.checksum().hash());
+            if cached_blob_matches(&destination, cf) {
+                continue;
+            }
             stage_and_rename_sync(&destination, |tmp| {
-                if let Some(cf) = expected {
-                    // MDC digest blobs own their bytes, even if a native cache
-                    // user later edits the source inode in place.
-                    use std::io::Read;
-                    let cap = metadata_byte_cap(cf);
-                    let count = std::io::copy(
-                        &mut file.take(cap + 1),
-                        &mut std::fs::File::create_new(tmp)?,
-                    )?;
-                    anyhow::ensure!(count <= cap, "HF metadata exceeds size cap");
-                    verify_metadata_file(tmp, cf)
-                } else {
-                    persist_captured_file(&path, file, tmp)
-                }
+                // MDC digest blobs must survive edits to the source inode.
+                use std::io::Read;
+                let cap = metadata_byte_cap(cf);
+                let count = std::io::copy(
+                    &mut file.take(cap + 1),
+                    &mut std::fs::File::create_new(tmp)?,
+                )?;
+                anyhow::ensure!(count <= cap, "HF metadata exceeds size cap");
+                verify_metadata_file(tmp, cf)
             })?;
         }
-        Ok(())
+        Ok(siblings)
     })
     .await?
 }
@@ -952,7 +945,7 @@ fn capture_metadata(
     dir: &Path,
     expected: &[(String, CheckedFile)],
     typed: &std::collections::HashSet<String>,
-) -> anyhow::Result<Vec<(String, PathBuf, std::fs::File)>> {
+) -> anyhow::Result<Vec<CapturedMetadataFile>> {
     let mut captured = Vec::new();
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
@@ -993,6 +986,79 @@ fn persist_captured_file(path: &Path, mut file: std::fs::File, tmp: &Path) -> an
     Ok(())
 }
 
+fn mdc_generation_digest(dir: &Path) -> anyhow::Result<blake3::Hash> {
+    use std::fs;
+
+    let mut entries = fs::read_dir(dir)?.collect::<std::io::Result<Vec<_>>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+    let mut identity = Vec::new();
+    for entry in entries {
+        append_framed_identity_value(&mut identity, entry.file_name().as_encoded_bytes());
+        let path = entry.path();
+        let kind = entry.file_type()?;
+        if kind.is_symlink() {
+            identity.push(b'L');
+            append_framed_identity_value(
+                &mut identity,
+                fs::read_link(path)?.as_os_str().as_encoded_bytes(),
+            );
+        } else {
+            anyhow::ensure!(
+                kind.is_file(),
+                "Invalid MDC generation entry {}",
+                path.display()
+            );
+            identity.push(b'F');
+            let digest = blake3::Hasher::new()
+                .update_reader(fs::File::open(path)?)?
+                .finalize();
+            identity.extend_from_slice(digest.as_bytes());
+        }
+    }
+    Ok(blake3::hash(&identity))
+}
+
+// Install a complete selection at once. The identifier also includes
+// unadvertised siblings, which are deliberately absent from mdcsum.
+fn publish_mdc_generation(
+    staged: tempfile::TempDir,
+    generations: &Path,
+) -> anyhow::Result<PathBuf> {
+    use std::fs;
+
+    let digest = mdc_generation_digest(staged.path())?;
+    #[cfg(unix)]
+    fs::set_permissions(staged.path(), fs::metadata(generations)?.permissions())?;
+
+    let mut repair = 0_u64;
+    loop {
+        let name = if repair == 0 {
+            digest.to_hex().to_string()
+        } else {
+            format!("{digest}-{repair}")
+        };
+        let destination = generations.join(name);
+        let metadata = match fs::symlink_metadata(&destination) {
+            Ok(metadata) => metadata,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                match fs::rename(staged.path(), &destination) {
+                    Ok(()) => return Ok(destination),
+                    Err(error) => fs::symlink_metadata(&destination).with_context(|| {
+                        format!("Publishing metadata at {}: {error}", destination.display())
+                    })?,
+                }
+            }
+            Err(e) => return Err(e.into()),
+        };
+        if metadata.is_dir() && mdc_generation_digest(&destination).is_ok_and(|d| d == digest) {
+            return Ok(destination);
+        }
+        // A cache cleanup or an edit can damage a generation.
+        // Keep existing card paths intact and try the next repair slot.
+        repair += 1;
+    }
+}
+
 fn cached_metadata_snapshot(
     repo_dir: &Path,
     files: &[(String, CheckedFile)],
@@ -1019,23 +1085,10 @@ fn cached_metadata_snapshot(
     {
         return main;
     }
-    if let Ok(entries) = std::fs::read_dir(snapshots) {
-        let mut candidates: Vec<_> = entries
-            .filter_map(Result::ok)
-            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
-            .filter(|entry| Some(&entry.path()) != main.as_ref())
-            .collect();
-        // Follow ModelExpress's offline preference when checksums cannot
-        // distinguish revisions that have different unadvertised siblings.
-        candidates.sort_by_cached_key(|entry| {
-            let time = entry
-                .metadata()
-                .and_then(|meta| meta.created().or_else(|_| meta.modified()))
-                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-            (std::cmp::Reverse(time), entry.file_name())
-        });
+    if let Ok(candidates) = crate::hub::recent_hf_snapshots(&snapshots) {
         for entry in candidates {
-            if consider(&entry.path()) {
+            let path = entry.path();
+            if Some(&path) != main.as_ref() && consider(&path) {
                 break;
             }
         }
@@ -1574,11 +1627,19 @@ impl ModelDeploymentCard {
     }
 
     /// Per-MDC resolve directory. After `download_config` runs, every
-    /// typed slot + harvested sibling is symlinked here for
-    /// `from_pretrained(local_dir)` consumers. Pure path — does not
-    /// create the directory; the resolve pipeline owns that.
+    /// typed slot and harvested sibling is available here for
+    /// `from_pretrained(local_dir)` consumers. The resolve pipeline creates
+    /// the directory.
     pub fn local_dir(&self) -> PathBuf {
-        mdc_local_path(&self.slug, self.mdcsum())
+        let flat = mdc_local_path(&self.slug, self.mdcsum());
+        let generations = mdc_hf_generations(&flat);
+        // CheckedFile paths carry the selected generation through serialization
+        // to Python and back, without adding a field to the card.
+        self.iter_metadata_files()
+            .into_iter()
+            .filter_map(|(file, _)| file.path()?.parent())
+            .find(|dir| dir.parent() == Some(generations.as_path()))
+            .map_or(flat, Path::to_path_buf)
     }
 
     pub(crate) fn is_systemone_serial_eligible(&self) -> bool {
@@ -2319,7 +2380,8 @@ impl ModelDeploymentCard {
         let source = self.source_path().to_string();
         let mdcsum = self.mdcsum().to_string();
         let blobs = mdc_blobs_dir()?;
-        let local_dir = mdc_local_dir(&self.slug, &mdcsum)?;
+        let local_dir = self.local_dir();
+        let generations = mdc_hf_generations(&mdc_local_path(&self.slug, &mdcsum));
 
         let mut entries = Vec::new();
         let mut ngc_snapshot = None;
@@ -2357,10 +2419,12 @@ impl ModelDeploymentCard {
             .iter()
             .filter_map(|(uri, _)| uri_basename(uri).ok())
             .collect();
+        let mut hf_siblings = Vec::new();
         for (repo, files) in hf_files {
-            resolve_hf_metadata_snapshot(&repo, files, &blobs, &local_dir, &typed_filenames)
+            let siblings = resolve_hf_metadata_snapshot(&repo, files, &blobs, &typed_filenames)
                 .await
                 .with_context(|| format!("Failed to resolve Hugging Face metadata for {repo}"))?;
+            hf_siblings.push(siblings);
         }
 
         let client = reqwest::Client::builder()
@@ -2368,6 +2432,7 @@ impl ModelDeploymentCard {
             .timeout(std::time::Duration::from_secs(300))
             .build()
             .context("building http client for metadata fetch")?;
+        let mut typed_links = Vec::new();
         for (uri, expected) in &entries {
             let filename = uri_basename(uri)?;
             // Hash is validated at MDC deserialize; safe as a path component.
@@ -2377,7 +2442,7 @@ impl ModelDeploymentCard {
             if !uri.starts_with("hf://") {
                 resolve_uri(&client, uri, expected, &blob).await?;
             }
-            symlink_force(&blob, &local_dir.join(&filename))?;
+            typed_links.push((filename, blob));
         }
         tracing::debug!(
             display_name = %self.display_name,
@@ -2389,15 +2454,48 @@ impl ModelDeploymentCard {
         // Harvest non-weight siblings (preprocessor_config.json, …) from
         // every snapshot dir we touched. Typed-slot basenames are passed
         // through so the harvest never overwrites them. No-op for `http://`.
-        let mut snapshot_dirs = std::collections::HashSet::new();
-        for (uri, _) in &entries {
-            if let Some(parent) = file_uri_parent(uri) {
-                snapshot_dirs.insert(parent);
+        let snapshot_dirs: std::collections::BTreeSet<_> = entries
+            .iter()
+            .filter_map(|(uri, _)| file_uri_parent(uri))
+            .collect();
+        let local_dir = tokio::task::spawn_blocking(move || {
+            let staged = if hf_siblings.is_empty() {
+                std::fs::create_dir_all(&local_dir)?;
+                None
+            } else {
+                std::fs::create_dir_all(&generations)?;
+                Some(tempfile::tempdir_in(&generations)?)
+            };
+            let publish_dir = staged
+                .as_ref()
+                .map_or(local_dir.as_path(), |dir| dir.path());
+            for (name, blob) in typed_links {
+                symlink_force(&blob, &publish_dir.join(name))?;
             }
-        }
-        for snap in &snapshot_dirs {
-            harvest_siblings(snap, &local_dir, &typed_filenames)?;
-        }
+            for siblings in hf_siblings {
+                for (name, source, file) in siblings {
+                    stage_and_rename_sync(&publish_dir.join(name), |tmp| {
+                        persist_captured_file(&source, file, tmp)
+                    })?;
+                }
+            }
+            for snap in snapshot_dirs {
+                // When mixing fresh HF and already-local paths, the previous
+                // card output is not an independent source for the new generation.
+                if staged.is_some()
+                    && local_dir.is_dir()
+                    && same_file::is_same_file(&snap, &local_dir)?
+                {
+                    continue;
+                }
+                harvest_siblings(&snap, publish_dir, &typed_filenames)?;
+            }
+            match staged {
+                Some(staged) => publish_mdc_generation(staged, &generations),
+                None => Ok(local_dir),
+            }
+        })
+        .await??;
 
         // Pass 3: rewrite cf.path to the cache symlink so downstream
         // tokenizer/config loaders read from a verified location.
@@ -3721,6 +3819,21 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn sibling_harvest_skips_an_alias_of_its_output_directory() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let local = root.path().join("local");
+        let alias = root.path().join("alias");
+        std::fs::create_dir(&local)?;
+        std::os::unix::fs::symlink(&local, &alias)?;
+        let sibling = local.join("special_tokens_map.json");
+        std::fs::write(&sibling, b"local EOS")?;
+        super::harvest_siblings(&alias, &local, &Default::default())?;
+        assert_eq!(std::fs::read(sibling)?, b"local EOS");
+        Ok(())
+    }
+
     #[test]
     fn no_ref_prefers_recent_matching_revision_for_legacy_siblings() -> anyhow::Result<()> {
         let root = tempfile::tempdir()?;
@@ -3866,6 +3979,12 @@ mod tests {
                         .eos_token_ids()
                         .contains(&200)
                 );
+                cold.download_config(None).await?;
+                assert!(
+                    HFConfig::from_json_file(cold.local_dir().join("config.json"))?
+                        .eos_token_ids()
+                        .contains(&200)
+                );
                 std::fs::remove_dir_all(cold.local_dir())?;
 
                 // A present, conflicting tokenizer cannot be excused by a valid shared blob.
@@ -3877,6 +3996,120 @@ mod tests {
                 assert!(cfg.eos_token_ids().contains(&200));
                 assert_eq!(cfg.bos_token_id(), Some(201));
                 Ok(())
+            },
+        )
+        .await
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn download_config_retires_absent_hf_siblings() -> anyhow::Result<()> {
+        let home = tempfile::tempdir()?;
+        let cache = home.path().join("hub");
+        let repo = cache.join("models--org--legacy");
+        let old = repo.join("snapshots/old");
+        let new = repo.join("snapshots/new");
+        let external = home.path().join("external");
+        std::fs::create_dir_all(&external)?;
+        std::fs::create_dir_all(repo.join("refs"))?;
+        std::fs::write(repo.join("refs/main"), b"old")?;
+        for snapshot in [&old, &new] {
+            std::fs::create_dir_all(snapshot)?;
+            std::fs::write(
+                snapshot.join("config.json"),
+                br#"{"architectures":["FakeForCausalLM"],"model_type":"fake","eos_token_id":2}"#,
+            )?;
+        }
+        std::fs::write(old.join("generation_config.json"), br#"{"eos_token_id":1}"#)?;
+        std::fs::write(old.join("external.json"), b"from HF")?;
+        std::fs::write(external.join("custom.json"), b"advertised external")?;
+        std::fs::write(external.join("external.json"), b"external sibling")?;
+
+        let mut card = ModelDeploymentCard::with_name_only("org/legacy");
+        card.model_info = Some(super::ModelInfoType::HfConfigJson(CheckedFile::from_disk(
+            old.join("config.json"),
+        )?));
+        card.move_to_url("hf://org/legacy/")?;
+        card.extra_files
+            .push(CheckedFile::from_disk(external.join("custom.json"))?);
+        temp_env::async_with_vars(
+            [
+                ("HOME", Some(home.path().as_os_str())),
+                ("HF_HUB_CACHE", Some(cache.as_os_str())),
+                ("HF_HUB_OFFLINE", Some("1".as_ref())),
+            ],
+            async {
+                let mut previous = card.clone();
+                previous.download_config(None).await?;
+                let previous_local = previous.local_dir();
+                assert_eq!(
+                    HFConfig::from_json_file(previous_local.join("config.json"))?.eos_token_ids(),
+                    [1]
+                );
+
+                let legacy = super::mdc_local_path(card.slug(), card.mdcsum());
+                std::fs::create_dir_all(&legacy)?;
+                std::fs::write(
+                    legacy.join("generation_config.json"),
+                    br#"{"eos_token_id":1}"#,
+                )?;
+
+                std::fs::remove_dir_all(&old)?;
+                let mut resolved = card.clone();
+                let mut concurrent = card.clone();
+                tokio::try_join!(
+                    resolved.download_config(None),
+                    concurrent.download_config(None)
+                )?;
+                let local = resolved.local_dir();
+                assert_eq!(local, concurrent.local_dir());
+                assert!(!local.join("generation_config.json").exists());
+                assert_eq!(
+                    HFConfig::from_json_file(local.join("config.json"))?.eos_token_ids(),
+                    [2]
+                );
+                assert_eq!(
+                    std::fs::read(local.join("custom.json"))?,
+                    b"advertised external"
+                );
+                assert_eq!(
+                    std::fs::read(local.join("external.json"))?,
+                    b"external sibling"
+                );
+                assert_eq!(
+                    HFConfig::from_json_file(previous_local.join("config.json"))?.eos_token_ids(),
+                    [1]
+                );
+                let serialized = resolved.to_json()?;
+                let restored = ModelDeploymentCard::load_from_json_str(&serialized)?;
+                assert_eq!(restored.local_dir(), local);
+                assert_eq!(
+                    std::fs::read(legacy.join("generation_config.json"))?,
+                    br#"{"eos_token_id":1}"#
+                );
+
+                // A partially evicted generation must not be returned or overwritten.
+                std::fs::remove_file(local.join("external.json"))?;
+                let mut repaired = card.clone();
+                let mut repaired_concurrently = card.clone();
+                tokio::try_join!(
+                    repaired.download_config(None),
+                    repaired_concurrently.download_config(None)
+                )?;
+                assert_ne!(repaired.local_dir(), local);
+                assert_eq!(repaired.local_dir(), repaired_concurrently.local_dir());
+                assert_eq!(
+                    std::fs::read(repaired.local_dir().join("external.json"))?,
+                    b"external sibling"
+                );
+                assert!(!local.join("external.json").exists());
+
+                // Exercise migration with only the old flat layout left on disk.
+                std::fs::remove_dir_all(super::mdc_hf_generations(&legacy))?;
+                card.download_config(None).await?;
+                assert_eq!(card.local_dir(), local);
+                assert!(!card.local_dir().join("generation_config.json").exists());
+                anyhow::Ok(())
             },
         )
         .await
@@ -3925,8 +4158,9 @@ mod tests {
                 assert_eq!(std::fs::read_dir(super::mdc_blobs_dir()?)?.count(), 0);
 
                 std::fs::write(metadata.join("tokenizer.json"), b"T")?;
-                card.clone().download_config(None).await?;
-                let local = card.local_dir();
+                let mut resolved = card.clone();
+                resolved.download_config(None).await?;
+                let local = resolved.local_dir();
                 assert_eq!(std::fs::read(local.join("config.json"))?, b"B");
                 assert_eq!(std::fs::read(local.join("tokenizer.json"))?, b"T");
                 assert_eq!(
