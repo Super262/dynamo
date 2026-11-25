@@ -784,6 +784,10 @@ fn symlink_force(target: &Path, link: &Path) -> anyhow::Result<()> {
 const ABSOLUTE_MAX_METADATA_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_MDC_SIBLING_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_MDC_GENERATION_SIBLING_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_HF_LOADER_HANDLES: usize = 64;
+const MAX_HF_AUXILIARY_HANDLES: usize = 32;
+// Allow another repository lock and the input/output of a checked copy.
+const HF_AUXILIARY_DESCRIPTOR_HEADROOM: usize = 3;
 
 /// File extensions that identify model weights. Callers: the frontend
 /// hf:// sibling harvest below and `local_model::harvest_extra_files`.
@@ -818,6 +822,13 @@ fn sibling_paths(
             return Ok(Vec::new());
         }
     };
+    collect_sibling_paths(entries, typed_filenames)
+}
+
+fn collect_sibling_paths(
+    entries: std::fs::ReadDir,
+    typed_filenames: &std::collections::HashSet<String>,
+) -> anyhow::Result<Vec<(String, PathBuf)>> {
     let mut siblings = Vec::new();
     for entry in entries {
         let path = entry?.path();
@@ -865,107 +876,178 @@ type CapturedMetadataFile = (String, std::fs::File);
 // advertised files so that harvested siblings also come from that revision.
 async fn resolve_hf_metadata_snapshot(
     repo: &str,
-    files: Vec<(String, CheckedFile)>,
+    files: Arc<[(String, CheckedFile)]>,
     blobs: &Path,
     typed: &std::collections::HashSet<String>,
+    retained: std::collections::HashSet<String>,
 ) -> anyhow::Result<Vec<CapturedMetadataFile>> {
-    let files: Arc<[_]> = files.into();
     let folder = hf_hub::Repo::model(repo.to_owned()).folder_name();
     let blobs = blobs.to_owned();
     let typed = typed.clone();
-    let (cached, files, blobs, typed) = tokio::task::spawn_blocking(move || {
-        let mut cached = None;
-        for root in crate::hub::hf_cache_roots() {
+    let (cached, files, blobs, typed, retained) = tokio::task::spawn_blocking(move || {
+        let cached = crate::hub::first_cache_hit(crate::hub::hf_cache_roots().map(|root| {
             let repo_dir = root.join(&folder);
-            cached = crate::hub::read_hf_checkout(&repo_dir, || {
-                cached_metadata_snapshot(&repo_dir, &files, &blobs)
-                    .map(|dir| capture_metadata(&dir, &files, &typed))
+            crate::hub::read_hf_checkout(&repo_dir, || {
+                cached_metadata_snapshot(&repo_dir, &files, &blobs)?
+                    .map(|dir| capture_checked_checkout(&dir, &files, &blobs, &typed, &retained))
                     .transpose()
-            })?;
-            if cached.is_some() {
-                break;
-            }
-        }
-        anyhow::Ok((cached, files, blobs, typed))
+            })
+        }))?;
+        anyhow::Ok((cached, files, blobs, typed, retained))
     })
     .await??;
-    let captured = match cached {
-        Some(captured) => captured,
-        None => {
-            let path = crate::hub::snapshot_for_checked_metadata(repo, files.clone()).await?;
-            let expected = files.clone();
-            let blob_dir = blobs.clone();
-            tokio::task::spawn_blocking(move || {
-                crate::hub::read_hf_checkout(crate::hub::hf_snapshot_repo(&path)?, || {
-                    matching_metadata_files(&path, &expected, Some(&blob_dir))?;
-                    capture_metadata(&path, &expected, &typed)
-                })
-            })
-            .await??
-        }
-    };
+    if let Some(cached) = cached {
+        return Ok(cached);
+    }
+
+    let path =
+        crate::hub::snapshot_for_checked_metadata(repo, files.clone(), blobs.clone()).await?;
     tokio::task::spawn_blocking(move || {
-        // Native HF eviction does not take our lock. Every advertised file
-        // missing at capture time must still have a verified MDC blob.
-        for (name, cf) in files.iter() {
-            if !captured.iter().any(|(n, _)| n == name) {
-                verify_metadata_file(&blobs.join(cf.checksum().hash()), cf)?;
-            }
-        }
-        let mut siblings = Vec::new();
-        for (name, file) in captured {
-            let Some((_, cf)) = files.iter().find(|(n, _)| *n == name) else {
-                siblings.push((name, file));
-                continue;
-            };
-            let destination = blobs.join(cf.checksum().hash());
-            if cached_blob_matches(&destination, cf) {
-                continue;
-            }
-            stage_and_rename_sync(&destination, |tmp| {
-                // MDC digest blobs must survive edits to the source inode.
-                use std::io::Read;
-                let cap = metadata_byte_cap(cf);
-                let count = std::io::copy(
-                    &mut file.take(cap + 1),
-                    &mut std::fs::File::create_new(tmp)?,
-                )?;
-                anyhow::ensure!(count <= cap, "HF metadata exceeds size cap");
-                verify_metadata_file(tmp, cf)
-            })?;
-        }
-        Ok(siblings)
+        crate::hub::read_hf_checkout(crate::hub::hf_snapshot_repo(&path)?, || {
+            matching_metadata_files(&path, &files, Some(&blobs))?;
+            capture_checked_checkout(&path, &files, &blobs, &typed, &retained)
+        })
     })
     .await?
 }
 
-// Open the selected generation's files while still holding the read lock.
-// File handles remain valid across rename and unlink, without holding a cache
-// lock during async work or borrowing a sibling symlink into a mutable checkout.
-fn capture_metadata(
+fn capture_checked_checkout(
     dir: &Path,
-    expected: &[(String, CheckedFile)],
+    files: &[(String, CheckedFile)],
+    blobs: &Path,
     typed: &std::collections::HashSet<String>,
+    retained: &std::collections::HashSet<String>,
 ) -> anyhow::Result<Vec<CapturedMetadataFile>> {
-    let mut captured = Vec::new();
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+    // Materialize checked slots one at a time while the checkout is stable.
+    for (name, expected) in files {
+        let source = dir.join(name);
+        let destination = blobs.join(expected.checksum().hash());
+        let Some(file) = open_metadata_file(&source, true)? else {
+            // Native HF eviction can remove a slot between validation and open.
+            verify_metadata_file(&destination, expected)
+                .with_context(|| format!("Missing HF metadata slot {}", source.display()))?;
             continue;
         };
-        let advertised = expected.iter().any(|(n, _)| *n == name);
-        if !advertised && (is_weight_file(&path) || typed.contains(&name)) {
+        anyhow::ensure!(
+            file.metadata()?.is_file(),
+            "{} is not a regular file",
+            source.display()
+        );
+        use std::io::Read;
+        let cap = metadata_byte_cap(expected);
+        if cached_blob_matches(&destination, expected) {
+            // The path checked while selecting the checkout may have been
+            // replaced. Authenticate the opened inode before reusing the blob.
+            let mut reader = file.take(cap + 1);
+            let digest = blake3::Hasher::new().update_reader(&mut reader)?.finalize();
+            anyhow::ensure!(
+                reader.limit() > 0,
+                "HF metadata exceeds size cap at {}",
+                source.display()
+            );
+            anyhow::ensure!(
+                digest.to_hex().as_str() == expected.checksum().hash(),
+                "checksum mismatch for {}",
+                source.display()
+            );
             continue;
         }
-        if !path.is_file() {
+        stage_and_rename_sync(&destination, |tmp| {
+            let count = std::io::copy(
+                &mut file.take(cap + 1),
+                &mut std::fs::File::create_new(tmp)?,
+            )?;
+            anyhow::ensure!(count <= cap, "HF metadata exceeds size cap");
+            verify_metadata_file(tmp, expected)
+        })?;
+    }
+    capture_metadata(dir, typed, retained)
+}
+
+// The caller holds the checkout lock. Retain only a bounded set of open sibling
+// handles across repository groups, so these files can be copied after unlock.
+fn capture_metadata(
+    dir: &Path,
+    typed: &std::collections::HashSet<String>,
+    retained: &std::collections::HashSet<String>,
+) -> anyhow::Result<Vec<CapturedMetadataFile>> {
+    let mut paths = collect_sibling_paths(std::fs::read_dir(dir)?, typed)?;
+    paths.sort_unstable_by(|(a, _), (b, _)| {
+        (!is_legacy_loader_sibling(a), a).cmp(&(!is_legacy_loader_sibling(b), b))
+    });
+    let mut loader_count = retained
+        .iter()
+        .filter(|name| is_legacy_loader_sibling(name))
+        .count();
+    let mut auxiliary_count = retained.len() - loader_count;
+    let mut captured = Vec::new();
+    let mut headroom = Vec::new();
+    for (name, path) in paths {
+        let loader = is_legacy_loader_sibling(&name);
+        let replaces = retained.contains(&name);
+        if !loader && !replaces && auxiliary_count >= MAX_HF_AUXILIARY_HANDLES {
             continue;
         }
-        if let Some(file) = open_metadata_file(&path, advertised)? {
-            captured.push((name, file));
+        let file = match open_metadata_file(&path, false) {
+            Ok(Some(file)) => file,
+            Ok(None) => continue,
+            Err(error)
+                if !loader
+                    && error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(descriptor_limit) =>
+            {
+                tracing::debug!(path = %path.display(), %error, "Stopping auxiliary sibling capture");
+                break;
+            }
+            Err(error) => return Err(error),
+        };
+        if headroom.is_empty() && (!loader || auxiliary_count > 0) {
+            // Preserve headroom while retaining auxiliaries, including when
+            // a later checkout adds loader files before any new auxiliaries.
+            match (0..HF_AUXILIARY_DESCRIPTOR_HEADROOM)
+                .map(|_| file.try_clone())
+                .collect::<std::io::Result<Vec<_>>>()
+            {
+                Ok(reserved) => headroom = reserved,
+                Err(error) if !loader && descriptor_limit(&error) => {
+                    tracing::debug!(path = %path.display(), %error, "Skipping auxiliary siblings to keep descriptor headroom");
+                    break;
+                }
+                Err(error) => return Err(error).context("Reserving metadata file descriptors"),
+            }
         }
+        if !replaces {
+            if loader {
+                anyhow::ensure!(
+                    loader_count < MAX_HF_LOADER_HANDLES,
+                    "Too many HF loader siblings; advertise required metadata files on the model card"
+                );
+                loader_count += 1;
+            } else {
+                auxiliary_count += 1;
+            }
+        }
+        captured.push((name, file));
     }
     Ok(captured)
+}
+
+fn descriptor_limit(error: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        matches!(error.raw_os_error(), Some(libc::EMFILE | libc::ENFILE))
+    }
+    #[cfg(windows)]
+    {
+        const ERROR_TOO_MANY_OPEN_FILES: i32 = 4;
+        error.raw_os_error() == Some(ERROR_TOO_MANY_OPEN_FILES)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = error;
+        false
+    }
 }
 
 fn open_metadata_file(path: &Path, advertised: bool) -> anyhow::Result<Option<std::fs::File>> {
@@ -974,13 +1056,10 @@ fn open_metadata_file(path: &Path, advertised: bool) -> anyhow::Result<Option<st
     match std::fs::File::open(path) {
         Ok(file) => Ok(Some(file)),
         Err(error)
-            if !advertised
-                && matches!(
-                    error.kind(),
-                    ErrorKind::NotFound | ErrorKind::PermissionDenied
-                ) =>
+            if error.kind() == ErrorKind::NotFound
+                || (!advertised && error.kind() == ErrorKind::PermissionDenied) =>
         {
-            tracing::debug!(path = %path.display(), %error, "Skipping unavailable metadata sibling");
+            tracing::debug!(path = %path.display(), %error, "Skipping unavailable metadata slot");
             Ok(None)
         }
         Err(error) => Err(error).with_context(|| format!("Opening {}", path.display())),
@@ -1185,7 +1264,7 @@ fn cached_metadata_snapshot(
     repo_dir: &Path,
     files: &[(String, CheckedFile)],
     blobs: &Path,
-) -> Option<PathBuf> {
+) -> anyhow::Result<Option<PathBuf>> {
     let snapshots = repo_dir.join("snapshots");
     let main = std::fs::read_to_string(repo_dir.join("refs/main"))
         .ok()
@@ -1205,22 +1284,32 @@ fn cached_metadata_snapshot(
     if let Some(path) = &main
         && consider(path)
     {
-        return main;
+        return Ok(main);
     }
-    if let Ok(candidates) = crate::hub::recent_hf_snapshots(&snapshots) {
-        for entry in candidates {
-            let path = entry.path();
-            if Some(&path) != main.as_ref() && consider(&path) {
+    let mut inspection_error = None;
+    for entry in crate::hub::recent_hf_snapshots(&snapshots)? {
+        let path = match entry {
+            Ok(entry) => entry.path(),
+            Err(error) => {
+                inspection_error = Some(error);
                 break;
             }
+        };
+        if Some(&path) != main.as_ref() && consider(&path) {
+            break;
         }
     }
-    best
+    if best.is_none()
+        && let Some(error) = inspection_error
+    {
+        return Err(error.into());
+    }
+    Ok(best)
 }
 
-// A missing local file can be supplied by its verified MDC blob. A conflicting
-// file rules out the entire checkout, including its unadvertised siblings.
-// A freshly downloaded private stage must supply every advertised file itself.
+// Cached and staged checkouts must identify themselves with a matching file.
+// Verified MDC blobs supply missing slots, while a present conflict rules out
+// the entire checkout and its unadvertised siblings.
 pub(super) fn matching_metadata_files(
     snapshot: &Path,
     files: &[(String, CheckedFile)],
@@ -2540,12 +2629,36 @@ impl ModelDeploymentCard {
             .iter()
             .filter_map(|(uri, _)| uri_basename(uri).ok())
             .collect();
-        let mut hf_siblings = Vec::new();
+        let has_hf_checkout = !hf_files.is_empty();
+        let mut hf_siblings = std::collections::BTreeMap::<String, _>::new();
         for (repo, files) in hf_files {
-            let siblings = resolve_hf_metadata_snapshot(&repo, files, &blobs, &typed_filenames)
-                .await
-                .with_context(|| format!("Failed to resolve Hugging Face metadata for {repo}"))?;
-            hf_siblings.push(siblings);
+            let files: Arc<[_]> = files.into();
+            let resolve = |retained| {
+                resolve_hf_metadata_snapshot(
+                    &repo,
+                    files.clone(),
+                    &blobs,
+                    &typed_filenames,
+                    retained,
+                )
+            };
+            let siblings = match resolve(hf_siblings.keys().cloned().collect()).await {
+                Err(error)
+                    if error.downcast_ref::<std::io::Error>().is_some_and(descriptor_limit)
+                        && hf_siblings.keys().any(|name| !is_legacy_loader_sibling(name)) =>
+                {
+                    hf_siblings.retain(|name, _| is_legacy_loader_sibling(name));
+                    resolve(hf_siblings.keys().cloned().collect())
+                        .await
+                        .map_err(|retry_error| {
+                            tracing::debug!(%repo, %retry_error, "Retry after releasing auxiliary metadata handles failed");
+                            error
+                        })
+                }
+                result => result,
+            }
+            .with_context(|| format!("Failed to resolve Hugging Face metadata for {repo}"))?;
+            hf_siblings.extend(siblings);
         }
 
         let client = reqwest::Client::builder()
@@ -2580,11 +2693,11 @@ impl ModelDeploymentCard {
             .filter_map(|(uri, _)| file_uri_parent(uri))
             .collect();
         let local_dir = tokio::task::spawn_blocking(move || {
-            if hf_siblings.is_empty() && local_dir.parent() == Some(generations.as_path()) {
+            if !has_hf_checkout && local_dir.parent() == Some(generations.as_path()) {
                 verify_mdc_generation(&local_dir)?;
                 return Ok(local_dir);
             }
-            let staged = if hf_siblings.is_empty() {
+            let staged = if !has_hf_checkout {
                 std::fs::create_dir_all(&local_dir)?;
                 None
             } else {
@@ -2616,7 +2729,7 @@ impl ModelDeploymentCard {
             }
             // A local custom template may supply an explicit checked override.
             // Its unchecked siblings only fill names the selected HF checkout lacks.
-            for (name, file) in hf_siblings.into_iter().flatten() {
+            for (name, file) in hf_siblings {
                 siblings.insert(name, MetadataSibling::Checkout(file));
             }
             copy_generation_siblings(
@@ -3964,7 +4077,7 @@ mod tests {
         std::fs::write(&model_file, b"old EOS")?;
         std::fs::write(cache.join("tokenizer.json"), b"from another source")?;
         let typed = ["tokenizer.json".to_owned()].into_iter().collect();
-        let mut captured = super::capture_metadata(&cache, &[], &typed)?;
+        let mut captured = super::capture_metadata(&cache, &typed, &Default::default())?;
         assert_eq!(captured.len(), 1);
         let (_, file) = captured.pop().unwrap();
         let next = root.path().join("next");
@@ -3975,7 +4088,9 @@ mod tests {
         assert_eq!(std::fs::read(&mdc_file)?, b"old EOS");
 
         let mdc_file = root.path().join("mdc-sibling-next");
-        let (_, file) = super::capture_metadata(&cache, &[], &typed)?.pop().unwrap();
+        let (_, file) = super::capture_metadata(&cache, &typed, &Default::default())?
+            .pop()
+            .unwrap();
         assert_eq!(super::copy_captured_file(file, &mdc_file, 64)?, Some(7));
         std::fs::write(&model_file, b"edited EOS")?;
         assert_eq!(std::fs::read(mdc_file)?, b"new EOS");
@@ -4038,20 +4153,209 @@ mod tests {
     }
 
     #[test]
-    fn sibling_evicted_before_open_is_ignored_only_when_optional() -> anyhow::Result<()> {
-        let root = tempfile::tempdir()?;
-        let sibling = root.path().join("metadata.json");
-        std::fs::write(&sibling, b"old sibling")?;
-        assert!(sibling.is_file());
-        std::fs::remove_file(&sibling)?;
+    fn capture_requires_a_verified_blob_when_an_advertised_slot_is_evicted() -> anyhow::Result<()> {
+        use std::fs;
 
-        assert!(super::open_metadata_file(&sibling, false)?.is_none());
-        let error = super::open_metadata_file(&sibling, true).unwrap_err();
+        let root = tempfile::tempdir()?;
+        let snapshot = root.path().join("snapshot");
+        let blobs = root.path().join("blobs");
+        fs::create_dir(&snapshot)?;
+        fs::create_dir(&blobs)?;
+        let config = snapshot.join("config.json");
+        let tokenizer = snapshot.join("tokenizer.json");
+        fs::write(&config, b"valid config")?;
+        fs::write(&tokenizer, b"valid tokenizer")?;
+        let files = [
+            ("config.json".to_owned(), CheckedFile::from_disk(config)?),
+            (
+                "tokenizer.json".to_owned(),
+                CheckedFile::from_disk(&tokenizer)?,
+            ),
+        ];
+        let typed = files.iter().map(|(name, _)| name.clone()).collect();
+        let blob = blobs.join(files[1].1.checksum().hash());
+        fs::remove_file(&tokenizer)?;
+
+        assert!(super::open_metadata_file(&tokenizer, true)?.is_none());
+        let capture = || {
+            super::capture_checked_checkout(&snapshot, &files, &blobs, &typed, &Default::default())
+        };
+        let error = capture().unwrap_err();
+        assert!(error.to_string().contains("Missing HF metadata slot"));
+        fs::write(&blob, b"valid tokenizer")?;
+        assert!(capture()?.is_empty());
+        fs::write(&blob, b"bad tokenizer")?;
+        assert!(capture().is_err());
+
+        fs::write(&blob, b"valid tokenizer")?;
+        fs::write(&tokenizer, b"valid tokenizer")?;
+        super::matching_metadata_files(&snapshot, &files, Some(&blobs))?;
+        let replacement = root.path().join("replacement");
+        fs::write(&replacement, b"bad tokenizer")?;
+        fs::rename(&replacement, &tokenizer)?;
+        let error = capture().unwrap_err();
+        assert!(format!("{error:#}").contains("checksum mismatch"));
+        assert_eq!(fs::read(&blob)?, b"valid tokenizer");
+        Ok(())
+    }
+
+    #[test]
+    fn hf_sibling_handles_are_bounded_and_preserve_loader_and_replacements() -> anyhow::Result<()> {
+        use std::fs;
+
+        let root = tempfile::tempdir()?;
+        for i in 0..200 {
+            fs::write(root.path().join(format!("aux-{i:03}.txt")), b"x")?;
+        }
+        fs::write(root.path().join("tokenizer.model"), b"loader")?;
+        let captured =
+            super::capture_metadata(root.path(), &Default::default(), &Default::default())?;
+        assert_eq!(captured.len(), super::MAX_HF_AUXILIARY_HANDLES + 1);
+        assert_eq!(captured[0].0, "tokenizer.model");
+        assert_eq!(captured[1].0, "aux-000.txt");
+
+        let retained = captured.into_iter().map(|(name, _)| name).collect();
+        let next = root.path().join("next");
+        fs::create_dir(&next)?;
+        fs::write(next.join("aux-000.txt"), b"replacement")?;
+        fs::write(next.join("aux-999.txt"), b"new")?;
+        fs::write(next.join("special_tokens_map.json"), b"new loader sibling")?;
+        let replacements = super::capture_metadata(&next, &Default::default(), &retained)?;
         assert_eq!(
-            error.downcast_ref::<std::io::Error>().unwrap().kind(),
-            std::io::ErrorKind::NotFound
+            replacements
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            ["special_tokens_map.json", "aux-000.txt"]
         );
         Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn hf_loader_metadata_resolves_under_descriptor_pressure() -> anyhow::Result<()> {
+        use std::fs;
+
+        const CHILD: &str = "DYNAMO_MDC_DESCRIPTOR_REGRESSION_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    "model_card::tests::hf_loader_metadata_resolves_under_descriptor_pressure",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .output()?;
+            assert!(
+                output.status.success(),
+                "low-descriptor child failed: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return Ok(());
+        }
+
+        let root = tempfile::tempdir()?;
+        let cache = root.path().join("hub");
+        let first = cache.join("models--org--a/snapshots/rev");
+        let second = cache.join("models--org--b/snapshots/rev");
+        let exact_fill = root.path().join("exact-fill");
+        fs::create_dir_all(&first)?;
+        fs::create_dir_all(&second)?;
+        fs::create_dir(&exact_fill)?;
+        fs::write(first.join("config.json"), b"config")?;
+        fs::write(first.join("tokenizer.model"), b"legacy tokenizer")?;
+        for i in 0..100 {
+            fs::write(first.join(format!("aux-{i:03}.txt")), b"a")?;
+        }
+        fs::write(second.join("tokenizer.json"), b"checked tokenizer")?;
+        let second_loaders = [
+            "added_tokens.json",
+            "merges.txt",
+            "special_tokens_map.json",
+            "tokenizer_config.json",
+            "vocab.json",
+        ];
+        for name in second_loaders {
+            fs::write(second.join(name), name)?;
+        }
+        for name in &second_loaders[..super::HF_AUXILIARY_DESCRIPTOR_HEADROOM] {
+            fs::write(exact_fill.join(name), name)?;
+        }
+
+        let mut single = ModelDeploymentCard::with_name_only("org/a");
+        single.model_info = Some(super::ModelInfoType::HfConfigJson(CheckedFile::from_disk(
+            first.join("config.json"),
+        )?));
+        single.move_to_url("hf://org/a/")?;
+        let mut mixed = single.clone();
+        let mut tokenizer = CheckedFile::from_disk(second.join("tokenizer.json"))?;
+        tokenizer.move_to_url(url::Url::parse("hf://org/b/tokenizer.json")?);
+        mixed.tokenizer = Some(super::TokenizerKind::HfTokenizerJson(tokenizer));
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: The pointer refers to initialized storage for getrlimit.
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let open = fs::read_dir("/proc/self/fd")?.count() as libc::rlim_t;
+        limit.rlim_cur = limit.rlim_cur.min(open + 9);
+        // SAFETY: This isolated subprocess lowers only its own soft limit.
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+
+        let typed = ["config.json".to_owned()].into_iter().collect();
+        let prior = super::capture_metadata(&first, &typed, &Default::default())?;
+        let retained = prior.iter().map(|(name, _)| name.clone()).collect();
+        let error =
+            super::capture_metadata(&exact_fill, &Default::default(), &retained).unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(super::descriptor_limit),
+            "{error:#}"
+        );
+        drop(prior);
+
+        temp_env::with_vars(
+            [
+                ("HOME", Some(root.path().as_os_str())),
+                ("HF_HUB_CACHE", Some(cache.as_os_str())),
+                ("HF_HUB_OFFLINE", Some("1".as_ref())),
+                ("MODEL_EXPRESS_NO_SHARED_STORAGE", Some("1".as_ref())),
+                ("MODEL_EXPRESS_URL", Some("http://[".as_ref())),
+            ],
+            || {
+                runtime.block_on(async {
+                    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                        single.download_config(None).await?;
+                        assert_eq!(
+                            fs::read(single.local_dir().join("tokenizer.model"))?,
+                            b"legacy tokenizer"
+                        );
+                        assert!(single.local_dir().join("aux-000.txt").is_file());
+
+                        mixed.download_config(None).await?;
+                        let output = mixed.local_dir();
+                        assert!(output.join("tokenizer.model").is_file());
+                        assert!(output.join("tokenizer.json").is_file());
+                        for name in second_loaders {
+                            assert_eq!(fs::read(output.join(name))?, name.as_bytes());
+                        }
+                        assert!(!output.join("aux-000.txt").exists());
+                        anyhow::Ok(())
+                    })
+                    .await?
+                })
+            },
+        )
     }
 
     #[cfg(unix)]
@@ -4086,7 +4390,7 @@ mod tests {
             "config.json".to_owned(),
             CheckedFile::from_disk(old.join("config.json"))?,
         )];
-        let selected = super::cached_metadata_snapshot(root.path(), &files, root.path()).unwrap();
+        let selected = super::cached_metadata_snapshot(root.path(), &files, root.path())?.unwrap();
         // Filesystems with coarse creation timestamps use the stable name tie-break.
         let stamp = |p: &Path| -> std::io::Result<_> {
             let meta = std::fs::metadata(p)?;
@@ -4106,12 +4410,14 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn warm_blobs_refetch_evicted_checkout_for_unadvertised_eos() -> anyhow::Result<()> {
+    async fn warm_blobs_supply_missing_slot_in_downloaded_checked_checkout() -> anyhow::Result<()> {
         let home = tempfile::tempdir()?;
         let cache = home.path().join("hub");
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/data/sample-models/mock-special-tokens-only");
-        let names = ["config.json", "tokenizer.json", "special_tokens_map.json"];
+        // The newly downloaded revision supplies config and the legacy EOS
+        // sibling, but its manifest does not include the advertised tokenizer.
+        let names = ["config.json", "special_tokens_map.json"];
         let mut hub = mockito::Server::new_async().await;
         let endpoint = hub.url();
         let revision = "0123456789012345678901234567890123456789";
@@ -4162,6 +4468,9 @@ mod tests {
                         .eos_token_ids()
                         .contains(&200)
                 );
+                assert!(card.local_dir().join("tokenizer.json").is_file());
+                let checkout = cache.join("models--org--legacy/snapshots").join(revision);
+                assert!(!checkout.join("tokenizer.json").exists());
                 lookup.assert_async().await;
                 for artifact in artifacts {
                     artifact.assert_async().await;
@@ -4813,7 +5122,7 @@ mod tests {
         assert!(
             super::capture_metadata(
                 &slug.path().join("does-not-exist"),
-                &[],
+                &Default::default(),
                 &Default::default(),
             )
             .is_err()
