@@ -782,6 +782,8 @@ fn symlink_force(target: &Path, link: &Path) -> anyhow::Result<()> {
 /// disk usage if a worker advertises a bogus `CheckedFile.size`, and is
 /// the fallback when `size` is absent on a `CheckedFile`.
 const ABSOLUTE_MAX_METADATA_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_MDC_SIBLING_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_MDC_GENERATION_SIBLING_BYTES: u64 = 256 * 1024 * 1024;
 
 /// File extensions that identify model weights. Callers: the frontend
 /// hf:// sibling harvest below and `local_model::harvest_extra_files`.
@@ -804,68 +806,56 @@ fn file_uri_parent(uri: &str) -> Option<PathBuf> {
     parent.is_dir().then(|| parent.to_path_buf())
 }
 
-/// Harvest non-weight files needed by model loaders. A published generation
-/// owns its sibling bytes so later edits to external sources cannot change it.
-///
-/// Names in `typed_filenames` are owned by the resolve loop's typed-slot
-/// pass. A fresh selection picks up changes to unadvertised siblings even
-/// when the advertised files give the card the same `mdcsum`.
+/// Find non-weight siblings that aren't already supplied by checked slots.
+fn sibling_paths(
+    snapshot_dir: &Path,
+    typed_filenames: &std::collections::HashSet<String>,
+) -> anyhow::Result<Vec<(String, PathBuf)>> {
+    let entries = match std::fs::read_dir(snapshot_dir) {
+        Ok(e) => e,
+        Err(error) => {
+            tracing::debug!(snapshot = %snapshot_dir.display(), %error, "Skipping unreadable sibling directory");
+            return Ok(Vec::new());
+        }
+    };
+    let mut siblings = Vec::new();
+    for entry in entries {
+        let path = entry?.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !typed_filenames.contains(name) && !is_weight_file(&path) && path.is_file() {
+            siblings.push((name.to_owned(), path));
+        }
+    }
+    Ok(siblings)
+}
+
+// Flat local cards keep using links to their source model files.
 fn harvest_siblings(
     snapshot_dir: &Path,
     local_dir: &Path,
     typed_filenames: &std::collections::HashSet<String>,
-    copy_into_generation: bool,
 ) -> anyhow::Result<()> {
-    let entries = match std::fs::read_dir(snapshot_dir) {
-        Ok(e) => e,
-        Err(e) => {
-            tracing::debug!(
-                snapshot = %snapshot_dir.display(),
-                error = %e,
-                "sibling harvest: snapshot dir unreadable, skipping",
-            );
-            return Ok(());
-        }
-    };
     // Re-resolving a card turns its advertised paths into file:// URLs.
     // Never turn its already-local siblings into links to themselves.
-    if same_file::is_same_file(snapshot_dir, local_dir)? {
+    let siblings = sibling_paths(snapshot_dir, typed_filenames)?;
+    if siblings.is_empty() || same_file::is_same_file(snapshot_dir, local_dir)? {
         return Ok(());
     }
-    for entry in entries {
-        let entry = entry?;
-        let path = entry.path();
-        if !path.is_file() || is_weight_file(&path) {
-            continue;
-        }
-        let name = match path.file_name().and_then(|n| n.to_str()) {
-            Some(n) if !n.is_empty() => n.to_owned(),
-            _ => continue,
-        };
-        if typed_filenames.contains(&name) {
-            continue;
-        }
-        let dst = local_dir.join(&name);
-        if copy_into_generation {
-            if let Some(file) = open_metadata_file(&path, false)? {
-                copy_captured_file(file, &dst)?;
-            }
-            continue;
-        }
-        // Resolve through the canonical target so a downstream
-        // `canonicalize` lands on a stable blob path rather than
-        // chasing snapshot-dir symlinks. `symlink_force` is idempotent
-        // and atomic via `stage_and_rename_sync`.
+    for (name, path) in siblings {
         let target = std::fs::canonicalize(&path).unwrap_or(path);
+        let dst = local_dir.join(&name);
         symlink_force(&target, &dst)
             .with_context(|| format!("harvesting {} -> {}", target.display(), dst.display()))?;
-        tracing::debug!(
-            file = %name,
-            target = %target.display(),
-            "harvested sibling into local_dir",
-        );
+        tracing::debug!(file = %name, target = %target.display(), "harvested sibling into local_dir");
     }
     Ok(())
+}
+
+enum MetadataSibling {
+    Checkout(std::fs::File),
+    Local(PathBuf),
 }
 
 type CapturedMetadataFile = (String, std::fs::File);
@@ -880,16 +870,23 @@ async fn resolve_hf_metadata_snapshot(
     typed: &std::collections::HashSet<String>,
 ) -> anyhow::Result<Vec<CapturedMetadataFile>> {
     let files: Arc<[_]> = files.into();
-    let repo_dir = crate::hub::hf_repo_cache_dir(repo);
+    let folder = hf_hub::Repo::model(repo.to_owned()).folder_name();
     let blobs = blobs.to_owned();
     let typed = typed.clone();
-    let (cached, files, blobs, repo_dir, typed) = tokio::task::spawn_blocking(move || {
-        let cached = crate::hub::read_hf_checkout(&repo_dir, || {
-            cached_metadata_snapshot(&repo_dir, &files, &blobs)
-                .map(|dir| capture_metadata(&dir, &files, &typed))
-                .transpose()
-        })?;
-        anyhow::Ok((cached, files, blobs, repo_dir, typed))
+    let (cached, files, blobs, typed) = tokio::task::spawn_blocking(move || {
+        let mut cached = None;
+        for root in crate::hub::hf_cache_roots() {
+            let repo_dir = root.join(&folder);
+            cached = crate::hub::read_hf_checkout(&repo_dir, || {
+                cached_metadata_snapshot(&repo_dir, &files, &blobs)
+                    .map(|dir| capture_metadata(&dir, &files, &typed))
+                    .transpose()
+            })?;
+            if cached.is_some() {
+                break;
+            }
+        }
+        anyhow::Ok((cached, files, blobs, typed))
     })
     .await??;
     let captured = match cached {
@@ -899,7 +896,7 @@ async fn resolve_hf_metadata_snapshot(
             let expected = files.clone();
             let blob_dir = blobs.clone();
             tokio::task::spawn_blocking(move || {
-                crate::hub::read_hf_checkout(&repo_dir, || {
+                crate::hub::read_hf_checkout(crate::hub::hf_snapshot_repo(&path)?, || {
                     matching_metadata_files(&path, &expected, Some(&blob_dir))?;
                     capture_metadata(&path, &expected, &typed)
                 })
@@ -990,12 +987,90 @@ fn open_metadata_file(path: &Path, advertised: bool) -> anyhow::Result<Option<st
     }
 }
 
-fn copy_captured_file(mut file: std::fs::File, dest: &Path) -> anyhow::Result<()> {
-    stage_and_rename_sync(dest, |tmp| {
-        std::io::copy(&mut file, &mut std::fs::File::create_new(tmp)?)?;
-        Ok(())
-    })
-    .with_context(|| format!("Publishing metadata sibling {}", dest.display()))
+fn copy_captured_file(
+    mut file: impl std::io::Read,
+    dest: &Path,
+    limit: u64,
+) -> anyhow::Result<Option<u64>> {
+    let tmp = unique_tmp_path(dest);
+    let _guard = TmpGuard::new(tmp.clone());
+    let mut output = std::fs::File::create_new(&tmp)?;
+    let copied = std::io::copy(&mut std::io::Read::take(&mut file, limit), &mut output)?;
+    if copied == limit {
+        match file.read_exact(&mut [0]) {
+            Ok(()) => return Ok(None),
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    drop(output);
+    std::fs::rename(&tmp, dest)?;
+    Ok(Some(copied))
+}
+
+fn is_legacy_loader_sibling(name: &str) -> bool {
+    matches!(
+        name,
+        "config.json"
+            | "params.json"
+            | "generation_config.json"
+            | "special_tokens_map.json"
+            | "tokenizer.json"
+            | "tokenizer_config.json"
+            | "tokenizer.model"
+            | "tekken.json"
+            | "vocab.json"
+            | "vocab.txt"
+            | "merges.txt"
+            | "added_tokens.json"
+            | "preprocessor_config.json"
+            | "processor_config.json"
+            | "image_processor_config.json"
+            | "video_preprocessor_config.json"
+            | "chat_template.jinja"
+            | "chat_template.json"
+    ) || name.starts_with("tokenizer.model.v")
+        || name.starts_with("tokenizer.mm.model.v")
+}
+
+fn copy_generation_siblings(
+    siblings: std::collections::BTreeMap<String, MetadataSibling>,
+    dest: &Path,
+    per_file: u64,
+    mut remaining: u64,
+) -> anyhow::Result<()> {
+    let mut siblings: Vec<_> = siblings.into_iter().collect();
+    // Auxiliaries must not exhaust the allowance before older cards' model
+    // metadata has been copied. The map supplies deterministic basename order.
+    siblings.sort_by_key(|(name, _)| !is_legacy_loader_sibling(name));
+    for (name, source) in siblings {
+        let file = match source {
+            MetadataSibling::Checkout(file) => file,
+            MetadataSibling::Local(path) => {
+                let Some(file) = open_metadata_file(&path, false)? else {
+                    continue;
+                };
+                file
+            }
+        };
+        let limit = per_file.min(remaining);
+        let copied = if file.metadata()?.len() <= limit {
+            copy_captured_file(file, &dest.join(&name), limit)
+                .with_context(|| format!("Publishing metadata sibling {name}"))?
+        } else {
+            None
+        };
+        if let Some(bytes) = copied {
+            remaining -= bytes;
+        } else {
+            anyhow::ensure!(
+                !is_legacy_loader_sibling(&name),
+                "Loader metadata sibling {name} exceeds the MDC sibling allowance of {limit} bytes; advertise it on the model card"
+            );
+            tracing::debug!(file = %name, limit, "Skipping oversized MDC sibling");
+        }
+    }
+    Ok(())
 }
 
 fn mdc_generation_digest(dir: &Path) -> anyhow::Result<blake3::Hash> {
@@ -2522,26 +2597,35 @@ impl ModelDeploymentCard {
             for (name, blob) in typed_links {
                 symlink_force(&blob, &publish_dir.join(name))?;
             }
-            for siblings in hf_siblings {
-                for (name, file) in siblings {
-                    copy_captured_file(file, &publish_dir.join(name))?;
+            let Some(staged) = staged else {
+                for snap in snapshot_dirs {
+                    harvest_siblings(&snap, &local_dir, &typed_filenames)?;
                 }
-            }
+                return Ok(local_dir);
+            };
+
+            let mut siblings = std::collections::BTreeMap::new();
             for snap in snapshot_dirs {
-                // When mixing fresh HF and already-local paths, the previous
-                // card output is not an independent source for the new generation.
-                if staged.is_some()
-                    && local_dir.is_dir()
-                    && same_file::is_same_file(&snap, &local_dir)?
-                {
+                // The previous card output is not a source for the new selection.
+                if local_dir.is_dir() && same_file::is_same_file(&snap, &local_dir)? {
                     continue;
                 }
-                harvest_siblings(&snap, publish_dir, &typed_filenames, staged.is_some())?;
+                for (name, path) in sibling_paths(&snap, &typed_filenames)? {
+                    siblings.insert(name, MetadataSibling::Local(path));
+                }
             }
-            match staged {
-                Some(staged) => publish_mdc_generation(staged, &generations),
-                None => Ok(local_dir),
+            // A local custom template may supply an explicit checked override.
+            // Its unchecked siblings only fill names the selected HF checkout lacks.
+            for (name, file) in hf_siblings.into_iter().flatten() {
+                siblings.insert(name, MetadataSibling::Checkout(file));
             }
+            copy_generation_siblings(
+                siblings,
+                staged.path(),
+                MAX_MDC_SIBLING_BYTES,
+                MAX_MDC_GENERATION_SIBLING_BYTES,
+            )?;
+            publish_mdc_generation(staged, &generations)
         })
         .await??;
 
@@ -3887,14 +3971,69 @@ mod tests {
         std::fs::write(&next, b"new EOS")?;
         std::fs::rename(next, &model_file)?;
         let mdc_file = root.path().join("mdc-sibling");
-        super::copy_captured_file(file, &mdc_file)?;
+        assert_eq!(super::copy_captured_file(file, &mdc_file, 64)?, Some(7));
         assert_eq!(std::fs::read(&mdc_file)?, b"old EOS");
 
         let mdc_file = root.path().join("mdc-sibling-next");
         let (_, file) = super::capture_metadata(&cache, &[], &typed)?.pop().unwrap();
-        super::copy_captured_file(file, &mdc_file)?;
+        assert_eq!(super::copy_captured_file(file, &mdc_file, 64)?, Some(7));
         std::fs::write(&model_file, b"edited EOS")?;
         assert_eq!(std::fs::read(mdc_file)?, b"new EOS");
+        Ok(())
+    }
+
+    #[test]
+    fn sibling_stream_over_limit_leaves_destination_unchanged() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let dest = root.path().join("sibling");
+        std::fs::write(&dest, b"old")?;
+
+        assert_eq!(super::copy_captured_file(&b"overflow"[..], &dest, 3)?, None);
+        assert_eq!(std::fs::read(&dest)?, b"old");
+        assert_eq!(std::fs::read_dir(root.path())?.count(), 1);
+        assert_eq!(super::copy_captured_file(&b"new"[..], &dest, 3)?, Some(3));
+        assert_eq!(std::fs::read(dest)?, b"new");
+        Ok(())
+    }
+
+    #[test]
+    fn generation_sibling_budget_preserves_legacy_loader_metadata() -> anyhow::Result<()> {
+        use super::MetadataSibling::{Checkout, Local};
+        use std::fs;
+
+        let root = tempfile::tempdir()?;
+        let dest = root.path().join("dest");
+        fs::create_dir(&dest)?;
+        let small = root.path().join("small");
+        let large = root.path().join("large");
+        let tiny = root.path().join("tiny");
+        fs::write(&small, b"abcd")?;
+        fs::write(&large, b"abcde")?;
+        fs::write(&tiny, b"a")?;
+
+        let siblings = [
+            ("a-auxiliary", Local(small.clone())),
+            ("hf-large", Checkout(fs::File::open(&large)?)),
+            ("local-large", Local(large.clone())),
+            ("special_tokens_map.json", Checkout(fs::File::open(&small)?)),
+            ("tokenizer.model", Local(small.clone())),
+            ("z-small", Local(tiny)),
+        ]
+        .into_iter()
+        .map(|(name, source)| (name.to_owned(), source))
+        .collect();
+        super::copy_generation_siblings(siblings, &dest, 4, 9)?;
+        for name in ["special_tokens_map.json", "tokenizer.model", "z-small"] {
+            assert!(dest.join(name).is_file(), "{name}");
+        }
+        for name in ["a-auxiliary", "hf-large", "local-large"] {
+            assert!(!dest.join(name).exists(), "{name}");
+        }
+
+        let oversized_loader = [("params.json".to_owned(), Local(large))].into();
+        let error = super::copy_generation_siblings(oversized_loader, &dest, 4, 9).unwrap_err();
+        assert!(error.to_string().contains("advertise it on the model card"));
+        assert!(!dest.join("params.json").exists());
         Ok(())
     }
 
@@ -3925,7 +4064,7 @@ mod tests {
         std::os::unix::fs::symlink(&local, &alias)?;
         let sibling = local.join("special_tokens_map.json");
         std::fs::write(&sibling, b"local EOS")?;
-        super::harvest_siblings(&alias, &local, &Default::default(), false)?;
+        super::harvest_siblings(&alias, &local, &Default::default())?;
         assert_eq!(std::fs::read(sibling)?, b"local EOS");
         Ok(())
     }
@@ -4131,16 +4270,30 @@ mod tests {
         }
         std::fs::write(old.join("generation_config.json"), br#"{"eos_token_id":1}"#)?;
         std::fs::write(old.join("external.json"), b"from HF")?;
-        std::fs::write(external.join("custom.json"), b"advertised external")?;
+        let custom_template = external.join("chat_template.jinja");
+        std::fs::write(&custom_template, b"{{ messages }}")?;
+        std::fs::write(
+            external.join("generation_config.json"),
+            br#"{"eos_token_id":9}"#,
+        )?;
         std::fs::write(external.join("external.json"), b"external sibling")?;
+        std::fs::write(external.join("external-only.json"), b"initial extra")?;
+        for archive in [
+            old.join("hf-dump.archive"),
+            external.join("local-dump.archive"),
+        ] {
+            std::fs::File::create(archive)?.set_len(super::MAX_MDC_SIBLING_BYTES + 1)?;
+        }
 
         let mut card = ModelDeploymentCard::with_name_only("org/legacy");
         card.model_info = Some(super::ModelInfoType::HfConfigJson(CheckedFile::from_disk(
             old.join("config.json"),
         )?));
         card.move_to_url("hf://org/legacy/")?;
-        card.extra_files
-            .push(CheckedFile::from_disk(external.join("custom.json"))?);
+        card.chat_template_file = Some(super::PromptFormatterArtifact::HfChatTemplateJinja {
+            is_custom: true,
+            file: CheckedFile::from_disk(custom_template)?,
+        });
         temp_env::async_with_vars(
             [
                 ("HOME", Some(home.path().as_os_str())),
@@ -4156,12 +4309,20 @@ mod tests {
                     [1]
                 );
 
-                std::fs::write(external.join("external.json"), b"external sibling edited")?;
                 assert_eq!(
                     std::fs::read(previous_local.join("external.json"))?,
-                    b"external sibling"
+                    b"from HF"
                 );
-                std::fs::write(external.join("external.json"), b"external sibling")?;
+                assert!(!previous_local.join("hf-dump.archive").exists());
+                assert!(!previous_local.join("local-dump.archive").exists());
+                std::fs::write(
+                    external.join("external-only.json"),
+                    b"external sibling edited",
+                )?;
+                assert_eq!(
+                    std::fs::read(previous_local.join("external-only.json"))?,
+                    b"initial extra"
+                );
 
                 let legacy = super::mdc_local_path(card.slug(), card.mdcsum());
                 std::fs::create_dir_all(&legacy)?;
@@ -4171,6 +4332,7 @@ mod tests {
                 )?;
 
                 std::fs::remove_dir_all(&old)?;
+                std::fs::remove_file(external.join("generation_config.json"))?;
                 let mut resolved = card.clone();
                 let mut concurrent = card.clone();
                 tokio::try_join!(
@@ -4185,8 +4347,8 @@ mod tests {
                     [2]
                 );
                 assert_eq!(
-                    std::fs::read(local.join("custom.json"))?,
-                    b"advertised external"
+                    std::fs::read(local.join("chat_template.jinja"))?,
+                    b"{{ messages }}"
                 );
                 assert_eq!(
                     std::fs::read(local.join("external.json"))?,
@@ -4617,7 +4779,7 @@ mod tests {
         std::fs::write(snap.path().join("tokenizer.model"), b"sp")?;
         // `.safetensors.index.json` is `.json`, not a weight — must be kept.
         std::fs::write(snap.path().join("model.safetensors.index.json"), b"idx")?;
-        super::harvest_siblings(snap.path(), slug.path(), &Default::default(), false)?;
+        super::harvest_siblings(snap.path(), slug.path(), &Default::default())?;
         assert!(slug.path().join("preprocessor_config.json").exists());
         assert!(slug.path().join("tokenizer.model").exists());
         assert!(slug.path().join("model.safetensors.index.json").exists());
@@ -4632,7 +4794,7 @@ mod tests {
         for weight in ["model.safetensors", "pytorch_model.bin", "model.gguf"] {
             std::fs::write(snap.path().join(weight), b"WEIGHTS")?;
         }
-        super::harvest_siblings(snap.path(), slug.path(), &Default::default(), false)?;
+        super::harvest_siblings(snap.path(), slug.path(), &Default::default())?;
         for weight in ["model.safetensors", "pytorch_model.bin", "model.gguf"] {
             assert!(!slug.path().join(weight).exists());
         }
@@ -4647,7 +4809,6 @@ mod tests {
             &slug.path().join("does-not-exist"),
             slug.path(),
             &Default::default(),
-            false,
         )?;
         assert!(
             super::capture_metadata(
@@ -4681,7 +4842,7 @@ mod tests {
 
         let typed_filenames: std::collections::HashSet<String> =
             ["config.json".to_string()].into_iter().collect();
-        super::harvest_siblings(snap.path(), slug.path(), &typed_filenames, false)?;
+        super::harvest_siblings(snap.path(), slug.path(), &typed_filenames)?;
 
         // Content equality is portable: `symlink_force` degrades to a copy
         // on non-Unix, so we can't depend on `is_symlink()`.
